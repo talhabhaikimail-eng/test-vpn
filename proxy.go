@@ -15,18 +15,39 @@ import (
 
 const wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
-// computeAcceptKey calculates the Sec-WebSocket-Accept header value
 func computeAcceptKey(secKey string) string {
 	h := sha1.New()
 	h.Write([]byte(strings.TrimSpace(secKey) + wsGUID))
 	return base64.StdEncoding.EncodeToString(h.Sum(nil))
 }
 
+func forward(dst io.Writer, src io.Reader, done chan struct{}) {
+	buf := make([]byte, 32768)
+	for {
+		nr, err := src.Read(buf)
+		if nr > 0 {
+			if _, ew := dst.Write(buf[:nr]); ew != nil {
+				break
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+	if tc, ok := dst.(*net.TCPConn); ok {
+		tc.CloseWrite()
+	}
+	done <- struct{}{}
+}
+
 func handleClient(clientConn net.Conn, targetAddr string) {
 	defer clientConn.Close()
 
-	// In Go, TCPConn sets TCP_NODELAY = true automatically
-	reader := bufio.NewReaderSize(clientConn, 65536)
+	if tc, ok := clientConn.(*net.TCPConn); ok {
+		tc.SetNoDelay(true)
+	}
+
+	reader := bufio.NewReader(clientConn)
 	req, err := http.ReadRequest(reader)
 	if err != nil {
 		return
@@ -34,7 +55,6 @@ func handleClient(clientConn net.Conn, targetAddr string) {
 
 	secKey := req.Header.Get("Sec-WebSocket-Key")
 
-	// Construct HTTP 101 Switching Protocols response
 	var resp bytes.Buffer
 	resp.WriteString("HTTP/1.1 101 Switching Protocols\r\n")
 	resp.WriteString("Upgrade: websocket\r\n")
@@ -48,39 +68,23 @@ func handleClient(clientConn net.Conn, targetAddr string) {
 		return
 	}
 
-	// Connect to local OpenSSH daemon
 	targetConn, err := net.Dial("tcp", targetAddr)
 	if err != nil {
 		return
 	}
 	defer targetConn.Close()
 
-	// Forward any buffered leftover bytes from the HTTP request phase
-	if reader.Buffered() > 0 {
-		buffered := make([]byte, reader.Buffered())
-		if _, err := io.ReadFull(reader, buffered); err == nil {
-			targetConn.Write(buffered)
-		}
+	if tc, ok := targetConn.(*net.TCPConn); ok {
+		tc.SetNoDelay(true)
 	}
 
-	// Full-duplex zero-copy forwarding using Linux splice(2) via io.Copy
 	done := make(chan struct{}, 2)
 
-	go func() {
-		io.Copy(targetConn, clientConn)
-		if tc, ok := targetConn.(*net.TCPConn); ok {
-			tc.CloseWrite()
-		}
-		done <- struct{}{}
-	}()
+	// Stream from reader (which contains any buffered HTTP leftover bytes + clientConn) to targetConn
+	go forward(targetConn, reader, done)
 
-	go func() {
-		io.Copy(clientConn, targetConn)
-		if cc, ok := clientConn.(*net.TCPConn); ok {
-			cc.CloseWrite()
-		}
-		done <- struct{}{}
-	}()
+	// Stream directly from targetConn (SSH) to clientConn
+	go forward(clientConn, targetConn, done)
 
 	<-done
 }
@@ -104,7 +108,7 @@ func main() {
 	defer listener.Close()
 
 	targetAddr := "127.0.0.1:" + targetPort
-	fmt.Printf("[WS-ePRO Go] Listening on 0.0.0.0:%s -> %s (Zero-Copy Splice Mode)\n", listenPort, targetAddr)
+	fmt.Printf("[WS-ePRO Go] Listening on 0.0.0.0:%s -> %s (Immediate-Flush Mode)\n", listenPort, targetAddr)
 
 	for {
 		clientConn, err := listener.Accept()
