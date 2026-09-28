@@ -19,10 +19,9 @@ TARGET_PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 22
 
 # Buffer size increased to 64KB for maximum throughput and minimum syscall overhead
 BUFFER_SIZE = 65536
-SOCKET_BUF_SIZE = 262144  # 256KB OS socket buffer
 
 def tune_socket(sock: socket.socket):
-    """Apply low-latency and high-throughput TCP socket options."""
+    """Apply low-latency TCP socket options while allowing Linux dynamic window scaling."""
     try:
         # Disable Nagle's algorithm - eliminates 40ms to 200ms ACK delay penalty
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -35,13 +34,6 @@ def tune_socket(sock: socket.socket):
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_QUICKACK, 1)
         except Exception:
             pass
-
-    # Expand TCP send/receive buffers to avoid window scaling bottlenecks
-    try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_BUF_SIZE)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_BUF_SIZE)
-    except Exception:
-        pass
 
 def compute_accept_key(sec_key: str) -> str:
     guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
