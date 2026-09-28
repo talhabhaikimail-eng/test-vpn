@@ -22,13 +22,17 @@ jobs:
         
       - name: Start Ngrok Tunnel
         run: |
-          # Start tunnel on port 80 (nginx-proxy will listen here)
-          ngrok http 80 --log=stdout > ngrok.log &
+          # Start tunnel on port 80 with designated domain
+          ngrok http 80 --domain=wand-dedicate-output.ngrok-free.dev --log=stdout > ngrok.log &
           sleep 5
           
           # Extract the assigned public domain name
           TUNNEL_URL=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[0].public_url')
           DOMAIN=$(echo "$TUNNEL_URL" | sed -e 's|^[^/]*//||')
+          if [ -z "$DOMAIN" ] || [ "$DOMAIN" = "null" ]; then
+            DOMAIN="wand-dedicate-output.ngrok-free.dev"
+            TUNNEL_URL="https://$DOMAIN"
+          fi
           echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
           echo "DOMAIN=$DOMAIN" >> $GITHUB_ENV
           
