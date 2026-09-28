@@ -1,4 +1,4 @@
-name: Test V2Ray Setup
+name: Test SSH + WebSocket Setup
 on:
   push:
   workflow_dispatch:
@@ -8,10 +8,10 @@ on:
         required: true
         default: '6'
         type: string
-      uuid:
-        description: 'Fixed UUID (leave default to keep client settings persistent)'
+      ssh_password:
+        description: 'Password for SSH user (vpnuser)'
         required: false
-        default: '2fadaa2a-e7f6-4efe-8b6e-ccad3787feae'
+        default: 'VpnPass1234!'
         type: string
 
 jobs:
@@ -22,25 +22,62 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Clone V2Ray Repository
-        run: |
-          git clone https://github.com/SanariSan/v2ray-ws-tls.git
-          
       - name: Install Ngrok
         run: |
-          # Fixed the download link to fetch the actual Linux Ngrok binary
           curl -sSL https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz | sudo tar -xz -C /usr/local/bin
-          
+
       - name: Authenticate Ngrok
         run: ngrok config add-authtoken ${{ secrets.NGROK_AUTH_TOKEN }}
-        
+
+      - name: Setup OpenSSH Server
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-server websockify python3-pip
+
+          # Ensure websockify is present
+          which websockify || sudo pip3 install --break-system-packages websockify
+
+          # Configure OpenSSH daemon
+          sudo sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#*AllowTcpForwarding.*/AllowTcpForwarding yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#*GatewayPorts.*/GatewayPorts yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#*PermitTunnel.*/PermitTunnel yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#*TCPKeepAlive.*/TCPKeepAlive yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#*ClientAliveInterval.*/ClientAliveInterval 30/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#*ClientAliveCountMax.*/ClientAliveCountMax 10/' /etc/ssh/sshd_config
+
+          # Configure sshd_config.d overrides
+          sudo mkdir -p /etc/ssh/sshd_config.d
+          echo -e "PasswordAuthentication yes\nAllowTcpForwarding yes\nGatewayPorts yes\nPermitTunnel yes" | sudo tee /etc/ssh/sshd_config.d/99-custom.conf
+
+          # Restart OpenSSH service
+          sudo systemctl restart ssh || sudo service ssh restart
+
+          # Create VPN SSH User
+          SSH_USER="vpnuser"
+          SSH_PASS="${{ github.event.inputs.ssh_password || 'VpnPass1234!' }}"
+          sudo useradd -m -s /bin/bash "$SSH_USER" 2>/dev/null || true
+          echo "$SSH_USER:$SSH_PASS" | sudo chpasswd
+          sudo usermod -aG sudo "$SSH_USER"
+          echo "SSH user '$SSH_USER' created successfully."
+
+      - name: Start WebSocket Bridge (Websockify)
+        run: |
+          # Kill anything on port 80
+          sudo fuser -k 80/tcp 2>/dev/null || true
+
+          # Start websockify translating port 80 (WebSocket) to 127.0.0.1:22 (SSH)
+          sudo websockify 80 127.0.0.1:22 --log-file=websockify.log &
+          sleep 2
+
+          # Verify listener
+          sudo ss -tulpn | grep 80 || netstat -tlpn | grep 80
+
       - name: Start Ngrok Tunnel
         run: |
-          # Start tunnel on port 80 with designated domain
           ngrok http 80 --domain=wand-dedicate-output.ngrok-free.dev --log=stdout > ngrok.log &
           sleep 5
-          
-          # Extract the assigned public domain name
+
           TUNNEL_URL=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[0].public_url')
           DOMAIN=$(echo "$TUNNEL_URL" | sed -e 's|^[^/]*//||')
           if [ -z "$DOMAIN" ] || [ "$DOMAIN" = "null" ]; then
@@ -49,75 +86,30 @@ jobs:
           fi
           echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
           echo "DOMAIN=$DOMAIN" >> $GITHUB_ENV
-          
-      - name: Configure and Start Containers
-        run: |
-          cd v2ray-ws-tls
-          
-          # Use configured UUID or default fixed UUID so client settings stay persistent
-          if [ -n "${{ github.event.inputs.uuid }}" ]; then
-            TEST_UUID="${{ github.event.inputs.uuid }}"
-          else
-            TEST_UUID="2fadaa2a-e7f6-4efe-8b6e-ccad3787feae"
-          fi
-          V2_PATH="/v2ray"
-          echo "TEST_UUID=$TEST_UUID" >> $GITHUB_ENV
-          echo "V2_PATH=$V2_PATH" >> $GITHUB_ENV
-          
-          # Patch Dockerfile to use debian:bookworm avoiding Bullseye EOL archive issues
-          sed -i 's/FROM debian:bullseye/FROM debian:bookworm/g' container/Dockerfile
-          
-          # Build V2Ray image
-          docker build -t nginx-v2ray ./container
-          
-          # Create required mount folders
-          mkdir -p log client
-          
-          # Start nginx-v2ray container on port 80 (Ngrok tunnels to port 80)
-          docker run --name nginx-v2ray -d \
-            -p 80:80 \
-            -v "$(pwd)/log:/log" \
-            -v "$(pwd)/client:/client" \
-            -e "DOMAIN=${DOMAIN}" \
-            -e "V2_PATH=${V2_PATH}" \
-            -e "V2_PORT=10000" \
-            -e "UUIDS=${TEST_UUID}" \
-            -e "REDIR_URL=https://bing.com" \
-            -e "ALTER_ID=0" \
-            nginx-v2ray
-          
-          # Check container status
-          sleep 3
-          docker ps
-          
+
       - name: Output Client Config Details
         run: |
+          SSH_PASS="${{ github.event.inputs.ssh_password || 'VpnPass1234!' }}"
           echo "========================================"
-          echo "V2Ray is now running!"
-          echo "Address: ${{ env.DOMAIN }}"
+          echo "SSH + WebSocket Tunnel is LIVE!"
+          echo "========================================"
+          echo "SSH Host: ${{ env.DOMAIN }}"
+          echo "SSH Port: 443"
+          echo "SSL/TLS: Enabled (tls)"
+          echo "SNI: ${{ env.DOMAIN }}"
+          echo "Username: vpnuser"
+          echo "Password: $SSH_PASS"
+          echo "========================================"
+          echo "NetMod Configuration:"
+          echo "Mode: SSH"
+          echo "Connection Type: SSH + SSL (TLS) / SSH + WS"
+          echo "Host / SNI: ${{ env.DOMAIN }}"
           echo "Port: 443"
-          echo "UUID: ${{ env.TEST_UUID }}"
-          echo "Path: ${{ env.V2_PATH }}"
-          echo "Network: ws (WebSocket)"
-          echo "TLS: Enabled (tls)"
           echo "========================================"
-          echo "CRITICAL: To bypass the Ngrok free-tier warning screen,"
-          echo "you MUST add this custom header under your client's WebSocket settings:"
-          echo ""
-          echo "ngrok-skip-browser-warning: 1"
-          echo "Host: ${{ env.DOMAIN }}"
+          echo "NetMod Payload:"
+          echo "GET / HTTP/1.1[crlf]Host: ${{ env.DOMAIN }}[crlf]ngrok-skip-browser-warning: 1[crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf][crlf]"
           echo "========================================"
-          echo ""
-          echo "Client configuration JSON (v2ray-ws-tls/client/config.json):"
-          cat v2ray-ws-tls/client/config.json 2>/dev/null || true
-          echo ""
-          echo "========================================"
-          echo "VMess Share Link:"
-          VMESS_JSON="{\"v\":\"2\",\"ps\":\"v2ray-ngrok\",\"add\":\"${DOMAIN}\",\"port\":\"443\",\"id\":\"${TEST_UUID}\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"${DOMAIN}\",\"path\":\"${V2_PATH}\",\"tls\":\"tls\",\"sni\":\"${DOMAIN}\"}"
-          echo -n "$VMESS_JSON" | base64 | tr -d '\n' | sed 's/^/vmess:\/\//'
-          echo ""
-          echo "========================================"
-          
+
       - name: Keep Alive
         run: |
           HOURS="${{ github.event.inputs.duration_hours || '6' }}"
@@ -127,4 +119,3 @@ jobs:
           fi
           echo "Waiting $HOURS hours ($SECONDS seconds) before shutting down..."
           sleep $SECONDS
-

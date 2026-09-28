@@ -1,37 +1,33 @@
-# Test V2Ray GitHub Actions Setup
+# SSH + WebSocket Tunnel on GitHub Actions
 
-This repository contains a GitHub Actions workflow to set up and test a temporary V2Ray proxy using Docker and Ngrok.
+This repository provides an OpenSSH + WebSocket tunnel over Ngrok for use with clients like NetMod, HTTP Custom, or any SSH client.
 
-## Prerequisites
-Before running the workflow, make sure you configure the following repository secret in GitHub:
-- `NGROK_AUTH_TOKEN`: Your Ngrok authentication token from [dashboard.ngrok.com](https://dashboard.ngrok.com).
-
-## Configuration
+## Repository Configuration
 - **Ngrok Domain**: `wand-dedicate-output.ngrok-free.dev`
 - **Secret**: `NGROK_AUTH_TOKEN` (configured in repository secrets)
-- **Default UUID**: `2fadaa2a-e7f6-4efe-8b6e-ccad3787feae`
-- **Keep-Alive Duration**: Up to 6 hours (configurable via `duration_hours` input)
 
-## Client Settings (v2rayN, v2rayNG, Nekoray, Shadowrocket, Clash)
-- **Protocol**: `VMess`
-- **Address**: `wand-dedicate-output.ngrok-free.dev`
-- **Port**: `443`
-- **UUID**: `2fadaa2a-e7f6-4efe-8b6e-ccad3787feae`
-- **AlterID**: `0`
-- **Security / Cipher**: `auto` (or `chacha20-poly1305`)
-- **Transport / Network**: `ws` (WebSocket)
-- **TLS**: `TLS` enabled (ServerName/SNI: `wand-dedicate-output.ngrok-free.dev`)
-- **Path**: `/v2ray`
+## NetMod Configuration (SSH + WebSocket)
 
-### Critical Custom Header (Ngrok Free Tier Requirement)
-Ngrok free tier displays an interstitial warning page which prevents the WebSocket handshake unless you add this HTTP header under your client's WebSocket settings:
-- **Header Key**: `ngrok-skip-browser-warning`
-- **Header Value**: `1`
-- **Host**: `wand-dedicate-output.ngrok-free.dev`
+In **NetMod**:
 
-## Usage
-1. Go to the **Actions** tab in your GitHub repository.
-2. Select **Test V2Ray Setup**.
-3. Click **Run workflow** (via `workflow_dispatch` or push).
-4. View the run logs to retrieve the connection details and credentials.
+### 1. SSH Profile Settings
+- **Mode**: `SSH`
+- **Tunnel / Connection Type**: `SSH + SSL (TLS)` or `SSH + WS (WebSocket)`
+- **SSH Host**: `wand-dedicate-output.ngrok-free.dev`
+- **SSH Port**: `443`
+- **SSL / SNI**: `wand-dedicate-output.ngrok-free.dev`
+- **Username**: `vpnuser`
+- **Password**: `VpnPass1234!`
 
+### 2. Custom Payload
+In NetMod's **Payload** box, paste:
+```http
+GET / HTTP/1.1[crlf]Host: wand-dedicate-output.ngrok-free.dev[crlf]ngrok-skip-browser-warning: 1[crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf][crlf]
+```
+
+## How It Works
+1. NetMod connects to Ngrok over HTTPS/TLS (`port 443`).
+2. NetMod sends the WebSocket upgrade request with custom header `ngrok-skip-browser-warning: 1`.
+3. Ngrok skips the free-tier interstitial page and routes the WebSocket stream to `websockify` on port 80.
+4. `websockify` decapsulates the WebSocket stream into raw TCP and connects to the OpenSSH server on `127.0.0.1:22`.
+5. NetMod authenticates and routes traffic as a SOCKS5/VPN tunnel.
