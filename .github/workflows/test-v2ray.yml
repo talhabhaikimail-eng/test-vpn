@@ -2,9 +2,22 @@ name: Test V2Ray Setup
 on:
   push:
   workflow_dispatch:
+    inputs:
+      duration_hours:
+        description: 'Duration to keep tunnel alive in hours (1-6)'
+        required: true
+        default: '6'
+        type: string
+      uuid:
+        description: 'Fixed UUID (leave default to keep client settings persistent)'
+        required: false
+        default: '2fadaa2a-e7f6-4efe-8b6e-ccad3787feae'
+        type: string
+
 jobs:
   test-proxy:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -41,8 +54,12 @@ jobs:
         run: |
           cd v2ray-ws-tls
           
-          # Generate a valid UUID natively in Ubuntu
-          TEST_UUID=$(cat /proc/sys/kernel/random/uuid)
+          # Use configured UUID or default fixed UUID so client settings stay persistent
+          if [ -n "${{ github.event.inputs.uuid }}" ]; then
+            TEST_UUID="${{ github.event.inputs.uuid }}"
+          else
+            TEST_UUID="2fadaa2a-e7f6-4efe-8b6e-ccad3787feae"
+          fi
           V2_PATH="/v2ray"
           echo "TEST_UUID=$TEST_UUID" >> $GITHUB_ENV
           echo "V2_PATH=$V2_PATH" >> $GITHUB_ENV
@@ -76,7 +93,7 @@ jobs:
       - name: Output Client Config Details
         run: |
           echo "========================================"
-          echo "V2Ray is running for 10 minutes!"
+          echo "V2Ray is now running!"
           echo "Address: ${{ env.DOMAIN }}"
           echo "Port: 443"
           echo "UUID: ${{ env.TEST_UUID }}"
@@ -84,10 +101,11 @@ jobs:
           echo "Network: ws (WebSocket)"
           echo "TLS: Enabled (tls)"
           echo "========================================"
-          echo "CRITICAL: To bypass the Ngrok warning screen, you MUST add this"
-          echo "custom header in your client's WebSocket (ws) settings:"
+          echo "CRITICAL: To bypass the Ngrok free-tier warning screen,"
+          echo "you MUST add this custom header under your client's WebSocket settings:"
           echo ""
           echo "ngrok-skip-browser-warning: 1"
+          echo "Host: ${{ env.DOMAIN }}"
           echo "========================================"
           echo ""
           echo "Client configuration JSON (v2ray-ws-tls/client/config.json):"
@@ -100,7 +118,13 @@ jobs:
           echo ""
           echo "========================================"
           
-      - name: Keep Alive (10 Minutes)
+      - name: Keep Alive
         run: |
-          echo "Waiting 10 minutes before shutting down..."
-          sleep 600
+          HOURS="${{ github.event.inputs.duration_hours || '6' }}"
+          SECONDS=$(( HOURS * 3600 ))
+          if [ $SECONDS -gt 21600 ] || [ $SECONDS -le 0 ]; then
+            SECONDS=21600
+          fi
+          echo "Waiting $HOURS hours ($SECONDS seconds) before shutting down..."
+          sleep $SECONDS
+
