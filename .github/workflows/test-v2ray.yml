@@ -1,0 +1,74 @@
+name: Test V2Ray Setup
+on:
+  workflow_dispatch:
+jobs:
+  test-proxy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Clone V2Ray Repository
+        run: |
+          git clone https://github.com/SanariSan/v2ray-ws-tls.git
+          
+      - name: Install Ngrok
+        run: |
+          # Fixed the download link to fetch the actual Linux Ngrok binary
+          curl -sSL https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz | sudo tar -xz -C /usr/local/bin
+          
+      - name: Authenticate Ngrok
+        run: ngrok config add-authtoken ${{ secrets.NGROK_AUTH_TOKEN }}
+        
+      - name: Start Ngrok Tunnel
+        run: |
+          # Start tunnel on port 80 (nginx-proxy will listen here)
+          ngrok http 80 --log=stdout > ngrok.log &
+          sleep 5
+          
+          # Extract the assigned public domain name
+          TUNNEL_URL=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[0].public_url')
+          DOMAIN=$(echo "$TUNNEL_URL" | sed -e 's|^[^/]*//||')
+          echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
+          echo "DOMAIN=$DOMAIN" >> $GITHUB_ENV
+          
+      - name: Configure and Start Containers
+        run: |
+          cd v2ray-ws-tls
+          cp .env.copy .env
+          
+          # Generate a valid UUID natively in Ubuntu
+          TEST_UUID=$(cat /proc/sys/kernel/random/uuid)
+          echo "TEST_UUID=$TEST_UUID" >> $GITHUB_ENV
+          
+          # Patch .env fields using the temporary Ngrok domain
+          sed -i "s/YOUR_DOMAIN=.*/YOUR_DOMAIN=${DOMAIN}/g" .env
+          sed -i "s/ACME_EMAIL=.*/ACME_EMAIL=test@example.com/g" .env
+          sed -i "s/UUIDS=.*/UUIDS=${TEST_UUID}/g" .env
+          
+          # Bypass Let's Encrypt validation since Ngrok handles HTTPS
+          sed -i '/nginx-proxy-acme/,+8d' docker-compose.yml 2>/dev/null || true
+          
+          # Boot the containers
+          docker compose up -d
+          
+      - name: Output Client Config Details
+        run: |
+          echo "========================================"
+          echo "V2Ray is running for 10 minutes!"
+          echo "Address: ${{ env.DOMAIN }}"
+          echo "Port: 443"
+          echo "UUID: ${{ env.TEST_UUID }}"
+          echo "Network: ws (WebSocket)"
+          echo "TLS: Enabled (tls)"
+          echo "========================================"
+          echo "CRITICAL: To bypass the Ngrok warning screen, you MUST add this"
+          echo "custom header in your client's WebSocket (ws) settings:"
+          echo ""
+          echo "ngrok-skip-browser-warning: 1"
+          echo "========================================"
+          
+      - name: Keep Alive (10 Minutes)
+        run: |
+          echo "Waiting 10 minutes before shutting down..."
+          sleep 600
