@@ -1,5 +1,6 @@
 name: Test V2Ray Setup
 on:
+  push:
   workflow_dispatch:
 jobs:
   test-proxy:
@@ -39,22 +40,38 @@ jobs:
       - name: Configure and Start Containers
         run: |
           cd v2ray-ws-tls
-          cp .env.copy .env
           
           # Generate a valid UUID natively in Ubuntu
           TEST_UUID=$(cat /proc/sys/kernel/random/uuid)
+          V2_PATH="/v2ray"
           echo "TEST_UUID=$TEST_UUID" >> $GITHUB_ENV
+          echo "V2_PATH=$V2_PATH" >> $GITHUB_ENV
           
-          # Patch .env fields using the temporary Ngrok domain
-          sed -i "s/YOUR_DOMAIN=.*/YOUR_DOMAIN=${DOMAIN}/g" .env
-          sed -i "s/ACME_EMAIL=.*/ACME_EMAIL=test@example.com/g" .env
-          sed -i "s/UUIDS=.*/UUIDS=${TEST_UUID}/g" .env
+          # Patch Dockerfile to use debian:bookworm avoiding Bullseye EOL archive issues
+          sed -i 's/FROM debian:bullseye/FROM debian:bookworm/g' container/Dockerfile
           
-          # Bypass Let's Encrypt validation since Ngrok handles HTTPS
-          sed -i '/nginx-proxy-acme/,+8d' docker-compose.yml 2>/dev/null || true
+          # Build V2Ray image
+          docker build -t nginx-v2ray ./container
           
-          # Boot the containers
-          docker compose up -d
+          # Create required mount folders
+          mkdir -p log client
+          
+          # Start nginx-v2ray container on port 80 (Ngrok tunnels to port 80)
+          docker run --name nginx-v2ray -d \
+            -p 80:80 \
+            -v "$(pwd)/log:/log" \
+            -v "$(pwd)/client:/client" \
+            -e "DOMAIN=${DOMAIN}" \
+            -e "V2_PATH=${V2_PATH}" \
+            -e "V2_PORT=10000" \
+            -e "UUIDS=${TEST_UUID}" \
+            -e "REDIR_URL=https://bing.com" \
+            -e "ALTER_ID=0" \
+            nginx-v2ray
+          
+          # Check container status
+          sleep 3
+          docker ps
           
       - name: Output Client Config Details
         run: |
@@ -63,6 +80,7 @@ jobs:
           echo "Address: ${{ env.DOMAIN }}"
           echo "Port: 443"
           echo "UUID: ${{ env.TEST_UUID }}"
+          echo "Path: ${{ env.V2_PATH }}"
           echo "Network: ws (WebSocket)"
           echo "TLS: Enabled (tls)"
           echo "========================================"
@@ -70,6 +88,16 @@ jobs:
           echo "custom header in your client's WebSocket (ws) settings:"
           echo ""
           echo "ngrok-skip-browser-warning: 1"
+          echo "========================================"
+          echo ""
+          echo "Client configuration JSON (v2ray-ws-tls/client/config.json):"
+          cat v2ray-ws-tls/client/config.json 2>/dev/null || true
+          echo ""
+          echo "========================================"
+          echo "VMess Share Link:"
+          VMESS_JSON="{\"v\":\"2\",\"ps\":\"v2ray-ngrok\",\"add\":\"${DOMAIN}\",\"port\":\"443\",\"id\":\"${TEST_UUID}\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"${DOMAIN}\",\"path\":\"${V2_PATH}\",\"tls\":\"tls\",\"sni\":\"${DOMAIN}\"}"
+          echo -n "$VMESS_JSON" | base64 | tr -d '\n' | sed 's/^/vmess:\/\//'
+          echo ""
           echo "========================================"
           
       - name: Keep Alive (10 Minutes)
