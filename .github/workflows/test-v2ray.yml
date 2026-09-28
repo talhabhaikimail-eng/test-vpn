@@ -39,6 +39,24 @@ jobs:
           sudo mv cloudflared /usr/local/bin/cloudflared
           cloudflared --version
 
+      - name: Optimize Linux Network Stack (TCP BBR & FastOpen)
+        run: |
+          # Enable BBR congestion control and FQ queue discipline
+          sudo modprobe tcp_bbr 2>/dev/null || true
+          echo "tcp_bbr" | sudo tee -a /etc/modules-load.d/bbr.conf 2>/dev/null || true
+
+          # Apply low-latency and bufferbloat mitigation sysctl settings
+          sudo sysctl -w net.core.default_qdisc=fq
+          sudo sysctl -w net.ipv4.tcp_congestion_control=bbr
+          sudo sysctl -w net.ipv4.tcp_fastopen=3
+          sudo sysctl -w net.ipv4.tcp_slow_start_after_idle=0
+          sudo sysctl -w net.ipv4.tcp_notsent_lowat=16384
+          sudo sysctl -w net.ipv4.tcp_rmem="4096 87380 16777216"
+          sudo sysctl -w net.ipv4.tcp_wmem="4096 65536 16777216"
+          sudo sysctl -w net.core.rmem_max=16777216
+          sudo sysctl -w net.core.wmem_max=16777216
+          sudo sysctl -w net.ipv4.tcp_mtu_probing=1
+
       - name: Setup OpenSSH Server
         run: |
           sudo apt-get update
@@ -50,12 +68,25 @@ jobs:
           sudo sed -i 's/^#*GatewayPorts.*/GatewayPorts yes/' /etc/ssh/sshd_config
           sudo sed -i 's/^#*PermitTunnel.*/PermitTunnel yes/' /etc/ssh/sshd_config
           sudo sed -i 's/^#*TCPKeepAlive.*/TCPKeepAlive yes/' /etc/ssh/sshd_config
-          sudo sed -i 's/^#*ClientAliveInterval.*/ClientAliveInterval 30/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#*ClientAliveInterval.*/ClientAliveInterval 15/' /etc/ssh/sshd_config
           sudo sed -i 's/^#*ClientAliveCountMax.*/ClientAliveCountMax 10/' /etc/ssh/sshd_config
 
-          # Configure sshd_config.d overrides
+          # Configure sshd_config.d overrides (Low latency: UseDNS no, Compression no, IPQoS)
           sudo mkdir -p /etc/ssh/sshd_config.d
-          echo -e "PasswordAuthentication yes\nAllowTcpForwarding yes\nGatewayPorts yes\nPermitTunnel yes" | sudo tee /etc/ssh/sshd_config.d/99-custom.conf
+          cat << 'EOF' | sudo tee /etc/ssh/sshd_config.d/99-custom.conf
+          PasswordAuthentication yes
+          AllowTcpForwarding yes
+          GatewayPorts yes
+          PermitTunnel yes
+          TCPKeepAlive yes
+          ClientAliveInterval 15
+          ClientAliveCountMax 10
+          UseDNS no
+          GSSAPIAuthentication no
+          Compression no
+          IPQoS lowdelay throughput
+          MaxStartups 100:30:200
+          EOF
 
           # Restart OpenSSH service
           sudo systemctl restart ssh || sudo service ssh restart
@@ -86,7 +117,7 @@ jobs:
           TOKEN="${{ secrets.CLOUDFLARE_TUNNEL_TOKEN || github.event.inputs.cf_tunnel_token }}"
           if [ -n "$TOKEN" ]; then
             echo "Starting named Cloudflare Tunnel with token..."
-            cloudflared tunnel run --token "$TOKEN" > cf_tunnel.log 2>&1 &
+            cloudflared tunnel --ha-connections 4 run --token "$TOKEN" > cf_tunnel.log 2>&1 &
             sleep 8
             echo "CF_TUNNEL_MODE=token" >> $GITHUB_ENV
             CUSTOM="${{ secrets.CUSTOM_DOMAIN || github.event.inputs.custom_domain }}"
@@ -98,7 +129,7 @@ jobs:
             echo "DOMAIN=$DOMAIN" >> $GITHUB_ENV
           else
             echo "Starting Cloudflare Quick Tunnel (trycloudflare.com)..."
-            cloudflared tunnel --url http://127.0.0.1:80 > cf_tunnel.log 2>&1 &
+            cloudflared tunnel --ha-connections 4 --url http://127.0.0.1:80 > cf_tunnel.log 2>&1 &
             
             # Wait for trycloudflare URL to appear in log
             for i in $(seq 1 30); do
