@@ -28,6 +28,7 @@ GET / HTTP/1.1[crlf]Host: wand-dedicate-output.ngrok-free.dev[crlf]ngrok-skip-br
 ## How It Works
 1. NetMod connects to Ngrok over HTTPS/TLS (`port 443`).
 2. NetMod sends the WebSocket upgrade request with custom header `ngrok-skip-browser-warning: 1`.
-3. Ngrok skips the free-tier interstitial page and routes the WebSocket stream to `websockify` on port 80.
-4. `websockify` decapsulates the WebSocket stream into raw TCP and connects to the OpenSSH server on `127.0.0.1:22`.
+3. Ngrok skips the free-tier interstitial page and routes the WebSocket stream to `proxy.py` on port 80.
+4. `proxy.py` returns `HTTP/1.1 101 Switching Protocols` and transparently bridges the raw TCP stream to the OpenSSH server on `127.0.0.1:22`.
 5. NetMod authenticates and routes traffic as a SOCKS5/VPN tunnel.
+

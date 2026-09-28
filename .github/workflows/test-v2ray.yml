@@ -32,10 +32,7 @@ jobs:
       - name: Setup OpenSSH Server
         run: |
           sudo apt-get update
-          sudo apt-get install -y openssh-server websockify python3-pip
-
-          # Ensure websockify is present
-          which websockify || sudo pip3 install --break-system-packages websockify
+          sudo apt-get install -y openssh-server
 
           # Configure OpenSSH daemon
           sudo sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
@@ -61,13 +58,14 @@ jobs:
           sudo usermod -aG sudo "$SSH_USER"
           echo "SSH user '$SSH_USER' created successfully."
 
-      - name: Start WebSocket Bridge (Websockify)
+      - name: Start WebSocket Bridge (WS-ePRO Python Proxy)
         run: |
           # Kill anything on port 80
           sudo fuser -k 80/tcp 2>/dev/null || true
 
-          # Start websockify translating port 80 (WebSocket) to 127.0.0.1:22 (SSH)
-          sudo websockify 80 127.0.0.1:22 --log-file=websockify.log &
+          # Start proxy.py bridging port 80 (HTTP 101 raw stream) to 127.0.0.1:22 (SSH)
+          chmod +x proxy.py
+          sudo python3 proxy.py 80 22 > proxy.log 2>&1 &
           sleep 2
 
           # Verify listener
