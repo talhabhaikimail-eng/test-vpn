@@ -13,8 +13,8 @@ on:
         required: false
         default: 'VpnPass1234!'
         type: string
-      cf_tunnel_token:
-        description: 'Optional Cloudflare Named Tunnel Token (leave empty for quick trycloudflare tunnel)'
+      custom_domain:
+        description: 'Your Cloudflare Public Hostname (e.g. ssh.yourdomain.com)'
         required: false
         default: ''
         type: string
@@ -87,6 +87,13 @@ jobs:
             cloudflared tunnel run --token "$TOKEN" > cf_tunnel.log 2>&1 &
             sleep 8
             echo "CF_TUNNEL_MODE=token" >> $GITHUB_ENV
+            CUSTOM="${{ secrets.CUSTOM_DOMAIN || github.event.inputs.custom_domain }}"
+            if [ -n "$CUSTOM" ]; then
+              DOMAIN="$CUSTOM"
+            else
+              DOMAIN="your-configured-cloudflare-domain"
+            fi
+            echo "DOMAIN=$DOMAIN" >> $GITHUB_ENV
           else
             echo "Starting Cloudflare Quick Tunnel (trycloudflare.com)..."
             cloudflared tunnel --url http://127.0.0.1:80 > cf_tunnel.log 2>&1 &
