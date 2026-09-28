@@ -19,6 +19,9 @@ on:
         default: ''
         type: string
 
+permissions:
+  contents: write
+
 jobs:
   test-proxy:
     runs-on: ubuntu-latest
@@ -108,11 +111,25 @@ jobs:
             echo "DOMAIN=$DOMAIN" >> $GITHUB_ENV
             echo "CF_URL=$CF_URL" >> $GITHUB_ENV
             echo "CF_TUNNEL_MODE=quick" >> $GITHUB_ENV
+
+            # Commit live domain file to repository for instant access
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            echo "$DOMAIN" > live_domain.txt
+            git add live_domain.txt
+            git commit -m "chore: live tunnel domain $DOMAIN [skip ci]" || true
+            git push origin main || true
           fi
 
       - name: Output Client Config Details
         run: |
           SSH_PASS="${{ github.event.inputs.ssh_password || 'VpnPass1234!' }}"
+          echo "### 🚀 Cloudflare Tunnel Domain: \`${{ env.DOMAIN }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **URL**: https://${{ env.DOMAIN }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **SSH User**: \`vpnuser\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **SSH Pass**: \`$SSH_PASS\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Bug Host**: \`jsbl.com\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Payload**: \`GET / HTTP/1.1[crlf]Host: ${{ env.DOMAIN }}[crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf][crlf]\`" >> $GITHUB_STEP_SUMMARY
           echo "========================================"
           echo "CLOUDFLARE + SSH + WS TUNNEL IS LIVE!"
           echo "========================================"
