@@ -13,6 +13,11 @@ on:
         required: false
         default: 'VpnPass1234!'
         type: string
+      cf_tunnel_token:
+        description: 'Optional Cloudflare Named Tunnel Token (leave empty for quick trycloudflare tunnel)'
+        required: false
+        default: ''
+        type: string
 
 jobs:
   test-proxy:
@@ -22,12 +27,12 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Install Ngrok
+      - name: Install Cloudflared
         run: |
-          curl -sSL https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz | sudo tar -xz -C /usr/local/bin
-
-      - name: Authenticate Ngrok
-        run: ngrok config add-authtoken ${{ secrets.NGROK_AUTH_TOKEN }}
+          curl -sSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          chmod +x cloudflared
+          sudo mv cloudflared /usr/local/bin/cloudflared
+          cloudflared --version
 
       - name: Setup OpenSSH Server
         run: |
@@ -71,41 +76,59 @@ jobs:
           # Verify listener
           sudo ss -tulpn | grep 80 || netstat -tlpn | grep 80
 
-      - name: Start Ngrok Tunnel
+      - name: Start Cloudflare Tunnel
         run: |
-          ngrok http 80 --domain=wand-dedicate-output.ngrok-free.dev --log=stdout > ngrok.log &
-          sleep 5
+          TOKEN="${{ secrets.CLOUDFLARE_TUNNEL_TOKEN || github.event.inputs.cf_tunnel_token }}"
+          if [ -n "$TOKEN" ]; then
+            echo "Starting named Cloudflare Tunnel with token..."
+            cloudflared tunnel run --token "$TOKEN" > cf_tunnel.log 2>&1 &
+            sleep 8
+            echo "CF_TUNNEL_MODE=token" >> $GITHUB_ENV
+          else
+            echo "Starting Cloudflare Quick Tunnel (trycloudflare.com)..."
+            cloudflared tunnel --url http://127.0.0.1:80 > cf_tunnel.log 2>&1 &
+            
+            # Wait for trycloudflare URL to appear in log
+            for i in $(seq 1 30); do
+              CF_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' cf_tunnel.log | head -n 1)
+              if [ -n "$CF_URL" ]; then
+                break
+              fi
+              sleep 1
+            done
 
-          TUNNEL_URL=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[0].public_url')
-          DOMAIN=$(echo "$TUNNEL_URL" | sed -e 's|^[^/]*//||')
-          if [ -z "$DOMAIN" ] || [ "$DOMAIN" = "null" ]; then
-            DOMAIN="wand-dedicate-output.ngrok-free.dev"
-            TUNNEL_URL="https://$DOMAIN"
+            if [ -z "$CF_URL" ]; then
+              echo "Error: Failed to obtain trycloudflare URL"
+              cat cf_tunnel.log
+              exit 1
+            fi
+
+            DOMAIN=$(echo "$CF_URL" | sed 's|https://||')
+            echo "Cloudflare Tunnel URL: $CF_URL"
+            echo "DOMAIN=$DOMAIN" >> $GITHUB_ENV
+            echo "CF_URL=$CF_URL" >> $GITHUB_ENV
+            echo "CF_TUNNEL_MODE=quick" >> $GITHUB_ENV
           fi
-          echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
-          echo "DOMAIN=$DOMAIN" >> $GITHUB_ENV
 
       - name: Output Client Config Details
         run: |
           SSH_PASS="${{ github.event.inputs.ssh_password || 'VpnPass1234!' }}"
           echo "========================================"
-          echo "SSH + WebSocket Tunnel is LIVE!"
+          echo "CLOUDFLARE + SSH + WS TUNNEL IS LIVE!"
           echo "========================================"
+          echo "Domain: ${{ env.DOMAIN }}"
+          echo "SSH User: vpnuser"
+          echo "SSH Pass: $SSH_PASS"
+          echo "Port: 80 (HTTP) or 443 (HTTPS/TLS)"
+          echo "========================================"
+          echo "Bug Host Payload Configuration:"
+          echo "Bug Host: jsbl.com (or any carrier zero-rated host)"
+          echo "Bug Port: 80"
           echo "SSH Host: ${{ env.DOMAIN }}"
-          echo "SSH Port: 443"
-          echo "SSL/TLS: Enabled (tls)"
-          echo "SNI: ${{ env.DOMAIN }}"
-          echo "Username: vpnuser"
-          echo "Password: $SSH_PASS"
+          echo "SSH Port: 80"
           echo "========================================"
-          echo "NetMod Configuration:"
-          echo "Mode: SSH"
-          echo "Connection Type: SSH + SSL (TLS) / SSH + WS"
-          echo "Host / SNI: ${{ env.DOMAIN }}"
-          echo "Port: 443"
-          echo "========================================"
-          echo "NetMod Payload:"
-          echo "GET / HTTP/1.1[crlf]Host: ${{ env.DOMAIN }}[crlf]ngrok-skip-browser-warning: 1[crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf][crlf]"
+          echo "Payload for NetMod / Download Engine:"
+          echo "GET / HTTP/1.1[crlf]Host: ${{ env.DOMAIN }}[crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf][crlf]"
           echo "========================================"
 
       - name: Keep Alive

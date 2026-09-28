@@ -1,34 +1,24 @@
-# SSH + WebSocket Tunnel on GitHub Actions
+# Cloudflare + SSH + WebSocket Tunnel on GitHub Actions
 
-This repository provides an OpenSSH + WebSocket tunnel over Ngrok for use with clients like NetMod, HTTP Custom, or any SSH client.
+This repository provides an OpenSSH + WebSocket tunnel connected directly to **Cloudflare's CDN Network** via `cloudflared`.
 
-## Repository Configuration
-- **Ngrok Domain**: `wand-dedicate-output.ngrok-free.dev`
-- **Secret**: `NGROK_AUTH_TOKEN` (configured in repository secrets)
+## Features
+- **Cloudflare Edge**: Connected to Cloudflare's Anycast network (no Ngrok browser warning page).
+- **Bug Host / Zero-Rating Support**: Dial any Cloudflare zero-rated Bug Host (e.g. `jsbl.com:80`) with `Host: <cloudflare-domain>`.
+- **WS-ePRO Python Bridge**: Automatically responds with `HTTP/1.1 101 Switching Protocols` and passes raw SSH streams directly to OpenSSH.
+- **Quick Tunnel & Named Tunnel**: Automatically creates a free `*.trycloudflare.com` domain by default, or accepts a permanent Cloudflare Tunnel token.
 
-## NetMod Configuration (SSH + WebSocket)
+## Configuration for Tunnel Clients (NetMod / Download Engine)
 
-In **NetMod**:
-
-### 1. SSH Profile Settings
-- **Mode**: `SSH`
-- **Tunnel / Connection Type**: `SSH + SSL (TLS)` or `SSH + WS (WebSocket)`
-- **SSH Host**: `wand-dedicate-output.ngrok-free.dev`
-- **SSH Port**: `443`
-- **SSL / SNI**: `wand-dedicate-output.ngrok-free.dev`
+- **Bug Host**: `jsbl.com` (or your carrier zero-rated host)
+- **Bug Port**: `80`
+- **Use TLS**: `false` (for port 80) or `true` (for port 443 with SNI)
+- **SSH Host**: `<assigned>.trycloudflare.com` (or your permanent domain)
+- **SSH Port**: `80`
 - **Username**: `vpnuser`
 - **Password**: `VpnPass1234!`
 
-### 2. Custom Payload
-In NetMod's **Payload** box, paste:
+### Payload
 ```http
-GET / HTTP/1.1[crlf]Host: wand-dedicate-output.ngrok-free.dev[crlf]ngrok-skip-browser-warning: 1[crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf][crlf]
+GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf][crlf]
 ```
-
-## How It Works
-1. NetMod connects to Ngrok over HTTPS/TLS (`port 443`).
-2. NetMod sends the WebSocket upgrade request with custom header `ngrok-skip-browser-warning: 1`.
-3. Ngrok skips the free-tier interstitial page and routes the WebSocket stream to `proxy.py` on port 80.
-4. `proxy.py` returns `HTTP/1.1 101 Switching Protocols` and transparently bridges the raw TCP stream to the OpenSSH server on `127.0.0.1:22`.
-5. NetMod authenticates and routes traffic as a SOCKS5/VPN tunnel.
-
