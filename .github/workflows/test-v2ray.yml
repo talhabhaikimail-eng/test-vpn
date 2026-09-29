@@ -10,13 +10,8 @@ on:
         required: true
         default: '6'
         type: string
-      ssh_password:
-        description: 'Password for SSH user (vpnuser)'
-        required: false
-        default: 'VpnPass1234!'
-        type: string
       custom_domain:
-        description: 'Your Cloudflare Public Hostname (e.g. ssh.yourdomain.com)'
+        description: 'Your Cloudflare Public Hostname (e.g. ssh.yourdomain.com) — leave blank to use trycloudflare.com'
         required: false
         default: ''
         type: string
@@ -40,8 +35,10 @@ jobs:
           cloudflared --version
 
       - name: Setup OpenSSH Server
+        env:
+          SSH_PASS: ${{ secrets.SSH_PASSWORD }}
         run: |
-          sudo apt-get update
+          sudo apt-get update -qq
           sudo apt-get install -y openssh-server
 
           # Configure OpenSSH daemon
@@ -53,7 +50,6 @@ jobs:
           sudo sed -i 's/^#*ClientAliveInterval.*/ClientAliveInterval 15/' /etc/ssh/sshd_config
           sudo sed -i 's/^#*ClientAliveCountMax.*/ClientAliveCountMax 10/' /etc/ssh/sshd_config
 
-          # Configure sshd_config.d overrides (UseDNS no, Compression no)
           sudo mkdir -p /etc/ssh/sshd_config.d
           cat << 'EOF' | sudo tee /etc/ssh/sshd_config.d/99-custom.conf
           PasswordAuthentication yes
@@ -69,24 +65,22 @@ jobs:
           MaxStartups 100:30:200
           EOF
 
-          # Restart OpenSSH service
           sudo systemctl restart ssh || sudo service ssh restart
 
-          # Create VPN SSH User
+          # Abort if SSH_PASSWORD secret is not set
+          if [ -z "$SSH_PASS" ]; then
+            echo "ERROR: SSH_PASSWORD secret is not set. Add it under Settings > Secrets > Actions."
+            exit 1
+          fi
+
           SSH_USER="vpnuser"
-          SSH_PASS="${{ github.event.inputs.ssh_password || 'VpnPass1234!' }}"
           sudo useradd -m -s /bin/bash "$SSH_USER" 2>/dev/null || true
           echo "$SSH_USER:$SSH_PASS" | sudo chpasswd
           sudo usermod -aG sudo "$SSH_USER"
-          echo "SSH user '$SSH_USER' created successfully."
+          echo "SSH user created."
 
       - name: Tune TCP Stack for High-Throughput / High-Latency (BDP Optimized)
         run: |
-          # --- BDP math for Pakistan (334ms RTT) ---
-          # To hit 50 Mbps you need: 50Mbps * 0.334s = ~2MB in-flight
-          # To hit 100 Mbps you need: ~4MB in-flight
-          # Default Linux buffers (87KB) cap you at ~2 Mbps at 334ms. Fix:
-
           # Max socket buffer: 16MB (allows auto-tuning up to full BDP)
           sudo sysctl -w net.core.rmem_max=16777216
           sudo sysctl -w net.core.wmem_max=16777216
@@ -95,56 +89,46 @@ jobs:
           sudo sysctl -w net.ipv4.tcp_rmem="4096 2097152 16777216"
           sudo sysctl -w net.ipv4.tcp_wmem="4096 2097152 16777216"
 
-          # BBR congestion control — built for high-latency, high-BDP links.
-          # CUBIC (default) backs off aggressively at 334ms; BBR does not.
+          # BBR congestion control — built for high-latency, high-BDP links
           sudo modprobe tcp_bbr 2>/dev/null || true
           sudo sysctl -w net.ipv4.tcp_congestion_control=bbr || true
 
-          # TCP Fast Open: saves 1 full RTT (334ms!) on new connections
+          # TCP Fast Open: saves 1 full RTT on new connections
           sudo sysctl -w net.ipv4.tcp_fastopen=3
 
-          # Disable delayed ACK — sends ACKs immediately, not batched every 40ms
+          # Disable delayed ACK
           sudo sysctl -w net.ipv4.tcp_low_latency=1 || true
 
-          # Increase backlog to absorb bursts without dropping SYN packets
+          # Increase backlog to absorb bursts
           sudo sysctl -w net.core.netdev_max_backlog=5000
           sudo sysctl -w net.core.somaxconn=4096
 
           # Disable TCP slow-start after idle — keeps window open on bursty 4G
           sudo sysctl -w net.ipv4.tcp_slow_start_after_idle=0
 
-          echo "TCP tuning applied. BBR: $(cat /proc/sys/net/ipv4/tcp_congestion_control)"
+          echo "BBR active: $(cat /proc/sys/net/ipv4/tcp_congestion_control)"
 
-
-      - name: Start WebSocket Bridge (Go High-Speed Zero-Copy Proxy)
+      - name: Start WebSocket Bridge (Go Zero-Copy Proxy)
         run: |
-          # Kill anything on port 80
           sudo fuser -k 80/tcp 2>/dev/null || true
 
-          # Build and start Go zero-copy proxy (fallback to proxy.py if go is unavailable)
           if command -v go &>/dev/null && [ -f proxy.go ]; then
-            echo "Building Go high-performance proxy..."
             go build -o proxy_bin proxy.go
-            sudo ./proxy_bin 80 22 > proxy.log 2>&1 &
+            sudo ./proxy_bin 80 22 > /dev/null 2>&1 &
           else
-            echo "Starting Python proxy..."
             chmod +x proxy.py
-            sudo python3 proxy.py 80 22 > proxy.log 2>&1 &
+            sudo python3 proxy.py 80 22 > /dev/null 2>&1 &
           fi
           sleep 2
-
-          # Verify listener
-          sudo ss -tulpn | grep 80 || netstat -tlpn | grep 80
+          sudo ss -tulpn | grep ':80' || true
 
       - name: Start Cloudflare Tunnel
         run: |
-          TOKEN="${{ secrets.CLOUDFLARE_TUNNEL_TOKEN || github.event.inputs.cf_tunnel_token }}"
+          TOKEN="${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}"
           if [ -n "$TOKEN" ]; then
-            echo "Starting named Cloudflare Tunnel with token..."
-            cloudflared tunnel run --token "$TOKEN" > cf_tunnel.log 2>&1 &
+            cloudflared tunnel run --token "$TOKEN" > /dev/null 2>&1 &
             sleep 8
-            echo "CF_TUNNEL_MODE=token" >> $GITHUB_ENV
-            CUSTOM="${{ secrets.CUSTOM_DOMAIN || github.event.inputs.custom_domain }}"
+            CUSTOM="${{ secrets.CUSTOM_DOMAIN }}"
             if [ -n "$CUSTOM" ]; then
               DOMAIN="$CUSTOM"
             else
@@ -152,65 +136,33 @@ jobs:
             fi
             echo "DOMAIN=$DOMAIN" >> $GITHUB_ENV
           else
-            echo "Starting Cloudflare Quick Tunnel (trycloudflare.com)..."
             cloudflared tunnel --url http://127.0.0.1:80 > cf_tunnel.log 2>&1 &
-            
-            # Wait for trycloudflare URL to appear in log
+
             for i in $(seq 1 30); do
               CF_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' cf_tunnel.log | head -n 1)
-              if [ -n "$CF_URL" ]; then
-                break
-              fi
+              if [ -n "$CF_URL" ]; then break; fi
               sleep 1
             done
 
             if [ -z "$CF_URL" ]; then
-              echo "Error: Failed to obtain trycloudflare URL"
-              cat cf_tunnel.log
+              echo "Failed to obtain trycloudflare URL"
               exit 1
             fi
 
             DOMAIN=$(echo "$CF_URL" | sed 's|https://||')
-            echo "Cloudflare Tunnel URL: $CF_URL"
             echo "DOMAIN=$DOMAIN" >> $GITHUB_ENV
-            echo "CF_URL=$CF_URL" >> $GITHUB_ENV
-            echo "CF_TUNNEL_MODE=quick" >> $GITHUB_ENV
 
-            # Commit live domain file to repository for instant access
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
             echo "$DOMAIN" > live_domain.txt
             git add live_domain.txt
-            git commit -m "chore: live tunnel domain $DOMAIN [skip ci]" || true
+            git commit -m "chore: update live domain [skip ci]" || true
             git push origin main || true
           fi
 
-      - name: Output Client Config Details
+      - name: Tunnel Ready
         run: |
-          SSH_PASS="${{ github.event.inputs.ssh_password || 'VpnPass1234!' }}"
-          echo "### 🚀 Cloudflare Tunnel Domain: \`${{ env.DOMAIN }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **URL**: https://${{ env.DOMAIN }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **SSH User**: \`vpnuser\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **SSH Pass**: \`$SSH_PASS\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Bug Host**: \`jsbl.com\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Payload**: \`GET / HTTP/1.1[crlf]Host: ${{ env.DOMAIN }}[crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf][crlf]\`" >> $GITHUB_STEP_SUMMARY
-          echo "========================================"
-          echo "CLOUDFLARE + SSH + WS TUNNEL IS LIVE!"
-          echo "========================================"
-          echo "Domain: ${{ env.DOMAIN }}"
-          echo "SSH User: vpnuser"
-          echo "SSH Pass: $SSH_PASS"
-          echo "Port: 80 (HTTP) or 443 (HTTPS/TLS)"
-          echo "========================================"
-          echo "Bug Host Payload Configuration:"
-          echo "Bug Host: jsbl.com (or any carrier zero-rated host)"
-          echo "Bug Port: 80"
-          echo "SSH Host: ${{ env.DOMAIN }}"
-          echo "SSH Port: 80"
-          echo "========================================"
-          echo "Payload for NetMod / Download Engine:"
-          echo "GET / HTTP/1.1[crlf]Host: ${{ env.DOMAIN }}[crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf][crlf]"
-          echo "========================================"
+          echo "Tunnel is live on domain: ${{ env.DOMAIN }}"
 
       - name: Keep Alive
         run: |
@@ -219,5 +171,4 @@ jobs:
           if [ $SECONDS -gt 21600 ] || [ $SECONDS -le 0 ]; then
             SECONDS=21600
           fi
-          echo "Waiting $HOURS hours ($SECONDS seconds) before shutting down..."
           sleep $SECONDS
