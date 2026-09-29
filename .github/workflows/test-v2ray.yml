@@ -125,7 +125,7 @@ jobs:
         run: |
           CF_TOKEN="${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}"
           if [ -n "$CF_TOKEN" ]; then
-            cloudflared tunnel --protocol http2 --ha-connections 1 --edge-ip-version 4 run --token "$CF_TOKEN" > /dev/null 2>&1 &
+            cloudflared tunnel --protocol quic run --token "$CF_TOKEN" > /dev/null 2>&1 &
             sleep 8
             CUSTOM="${{ secrets.CUSTOM_DOMAIN }}"
             DOMAIN="${CUSTOM:-your-configured-cloudflare-domain}"
