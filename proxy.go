@@ -1,4 +1,3 @@
-
 package main
 
 import (
@@ -24,20 +23,12 @@ const (
 	wsGUID           = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 	maxHeaderBytes   = 16 << 10        // 16 KB — caps slowloris header floods
 	handshakeTimeout = 10 * time.Second
-	dialTimeout      = 2 * time.Second // fail fast against dead upstream
+	dialTimeout      = 5 * time.Second
 	keepAlivePeriod  = 15 * time.Second
 	maxUptimeHours   = 6
 )
 
-var (
-	startTime = time.Now()
-	pktZone   = time.FixedZone("PKT", 5*60*60) // built once, reused
-
-	// Static prefix of the 101 response — precomputed once at load.
-	resp101Prefix = []byte("HTTP/1.1 101 Switching Protocols\r\n" +
-		"Upgrade: websocket\r\n" +
-		"Connection: Upgrade\r\n")
-)
+var startTime = time.Now()
 
 // serverBanner returns the live countdown header value, PKT-localised.
 func serverBanner() string {
@@ -46,26 +37,23 @@ func serverBanner() string {
 	if remaining < 0 {
 		remaining = 0
 	}
-	started := startTime.In(pktZone).Format("02 Jan 2006 15:04 PKT")
+	pkt := time.FixedZone("PKT", 5*60*60)
+	started := startTime.In(pkt).Format("02 Jan 2006 15:04 PKT")
 	return fmt.Sprintf("Made By Talha \u2764 | Started: %s | Restarts in %dh %02dm",
 		started, int(remaining.Hours()), int(remaining.Minutes())%60)
 }
 
-// acceptKey computes the Sec-WebSocket-Accept value into a stack array —
-// 20 bytes -> exactly 28 base64 chars, no heap allocation.
+// acceptKey computes the Sec-WebSocket-Accept value.
 func acceptKey(secKey string) string {
-	sum := sha1.Sum([]byte(strings.TrimSpace(secKey) + wsGUID))
-	var b [28]byte
-	base64.StdEncoding.Encode(b[:], sum[:])
-	return string(b[:])
+	sum := sha1.Sum([]byte(strings.TrimSpace(secKey) + wsGUID)) // sha1.Sum: no heap alloc
+	return base64.StdEncoding.EncodeToString(sum[:])
 }
 
-// tune sets TCP_NODELAY + keepalive + QUICKACK on a TCPConn.
+// tune sets TCP_NODELAY + keepalive on a TCPConn.
 func tune(c *net.TCPConn) {
 	_ = c.SetNoDelay(true)
 	_ = c.SetKeepAlive(true)
 	_ = c.SetKeepAlivePeriod(keepAlivePeriod)
-	
 }
 
 // pipe copies src -> dst. With both ends *net.TCPConn, io.Copy triggers
@@ -91,40 +79,36 @@ func handleClient(client *net.TCPConn, target string) {
 	}
 	secKey := req.Header.Get("Sec-WebSocket-Key")
 
-	// ── Send 101 Switching Protocols BEFORE dialing upstream ────────────────
-	// The client sees 101 immediately; the upstream dial no longer blocks
-	// the perceived connect time. On dial failure we simply close — tunnel
-	// clients auto-reconnect, so a clean 502 isn't worth the extra RTT.
-	var resp []byte
-	if secKey != "" {
-		resp = []byte("HTTP/1.1 101 Switching Protocols\r\n" +
-			"Upgrade: websocket\r\n" +
-			"Connection: Upgrade\r\n" +
-			"Sec-WebSocket-Accept: " + acceptKey(secKey) + "\r\n" +
-			"X-Server-Info: " + serverBanner() + "\r\n" +
-			fmt.Sprintf("X-Server-Uptime: %.0fs\r\n", time.Since(startTime).Seconds()) +
-			"\r\n")
-	} else {
-		resp = append(append([]byte{}, resp101Prefix...),
-			[]byte("X-Server-Info: "+serverBanner()+
-				fmt.Sprintf("\r\nX-Server-Uptime: %.0fs\r\n\r\n", time.Since(startTime).Seconds()))...)
-	}
-
-	if _, err := client.Write(resp); err != nil {
-		return
-	}
-	_ = client.SetReadDeadline(time.Time{}) // clear deadline — data phase is unbounded
-
-	// ── Dial upstream AFTER 101 ─────────────────────────────────────────────
+	// ── Dial upstream BEFORE sending 101 ────────────────────────────────────
+	// If SSH is down we return 502 instead of a broken tunnel.
 	d := net.Dialer{Timeout: dialTimeout}
 	c, err := d.Dial("tcp", target)
 	if err != nil {
 		log.Printf("dial %s: %v", target, err)
+		_, _ = client.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
 		return
 	}
 	upstream := c.(*net.TCPConn)
 	defer upstream.Close()
 	tune(upstream)
+
+	// ── Send 101 Switching Protocols ─────────────────────────────────────────
+	var resp strings.Builder
+	resp.WriteString("HTTP/1.1 101 Switching Protocols\r\n")
+	resp.WriteString("Upgrade: websocket\r\n")
+	resp.WriteString("Connection: Upgrade\r\n")
+	if secKey != "" {
+		fmt.Fprintf(&resp, "Sec-WebSocket-Accept: %s\r\n", acceptKey(secKey))
+	}
+	// Live banner headers — tunnel clients that surface WS response headers see this.
+	fmt.Fprintf(&resp, "X-Server-Info: %s\r\n", serverBanner())
+	fmt.Fprintf(&resp, "X-Server-Uptime: %.0fs\r\n", time.Since(startTime).Seconds())
+	resp.WriteString("\r\n")
+
+	if _, err := client.Write([]byte(resp.String())); err != nil {
+		return
+	}
+	_ = client.SetReadDeadline(time.Time{}) // clear deadline — data phase is unbounded
 
 	// ── Drain bufio pre-read bytes ───────────────────────────────────────────
 	// http.ReadRequest may have pulled bytes beyond the headers into br's
@@ -144,9 +128,9 @@ func handleClient(client *net.TCPConn, target string) {
 }
 
 func main() {
-	listen := flag.String("listen", "0.0.0.0:80", "listen address")
-	target := flag.String("target", "127.0.0.1:22", "upstream SSH address")
-	maxConns := flag.Int("max-conns", 1024, "max concurrent connections")
+	listen   := flag.String("listen",    "0.0.0.0:80",    "listen address")
+	target   := flag.String("target",   "127.0.0.1:22",  "upstream SSH address")
+	maxConns := flag.Int("max-conns",   1024,             "max concurrent connections")
 	flag.Parse()
 
 	// Graceful shutdown on SIGINT / SIGTERM.
