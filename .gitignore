@@ -4,3 +4,5 @@
 *.exe
 proxy_bin
 proxy_test_bin
+*.key
+*.pem
