@@ -11,37 +11,69 @@ on:
         default: '6'
         type: string
       custom_domain:
-        description: 'Your Cloudflare Public Hostname (e.g. ssh.yourdomain.com) — leave blank to use trycloudflare.com'
+        description: 'Cloudflare Public Hostname — leave blank for trycloudflare.com'
         required: false
         default: ''
         type: string
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   test-proxy:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    env:
+      GH_TOKEN: ${{ secrets.PAT_TOKEN }}
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      # ── Concurrency guard ───────────────────────────────────────────────────
+      # Cancel every other in-progress run of this workflow so only the newest
+      # one stays alive. The PAT_TOKEN is required because GITHUB_TOKEN cannot
+      # cancel sibling runs on public repos.
+      - name: Cancel Older Runs (keep only this one)
+        run: |
+          REPO="${{ github.repository }}"
+          THIS_RUN="${{ github.run_id }}"
+          WORKFLOW="test-v2ray.yml"
+
+          echo "Current run ID: $THIS_RUN"
+
+          # Fetch all in_progress runs for this workflow
+          RUNS=$(gh api "repos/$REPO/actions/workflows/$WORKFLOW/runs?status=in_progress&per_page=50" \
+            --jq '.workflow_runs[] | select(.status=="in_progress") | .id')
+
+          for RUN_ID in $RUNS; do
+            if [ "$RUN_ID" != "$THIS_RUN" ]; then
+              echo "Cancelling old run $RUN_ID..."
+              gh api -X POST "repos/$REPO/actions/runs/$RUN_ID/cancel" || true
+            fi
+          done
+          echo "Concurrency cleanup done."
+
+      # ── Install tools ───────────────────────────────────────────────────────
       - name: Install Cloudflared
         run: |
           curl -sSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
           chmod +x cloudflared
           sudo mv cloudflared /usr/local/bin/cloudflared
-          cloudflared --version
 
+      # ── SSH Server ──────────────────────────────────────────────────────────
       - name: Setup OpenSSH Server
         env:
           SSH_PASS: ${{ secrets.SSH_PASSWORD }}
         run: |
+          if [ -z "$SSH_PASS" ]; then
+            echo "ERROR: SSH_PASSWORD secret is not set."
+            exit 1
+          fi
+
           sudo apt-get update -qq
           sudo apt-get install -y openssh-server
 
-          # Configure OpenSSH daemon
           sudo sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
           sudo sed -i 's/^#*AllowTcpForwarding.*/AllowTcpForwarding yes/' /etc/ssh/sshd_config
           sudo sed -i 's/^#*GatewayPorts.*/GatewayPorts yes/' /etc/ssh/sshd_config
@@ -51,54 +83,37 @@ jobs:
           sudo sed -i 's/^#*ClientAliveCountMax.*/ClientAliveCountMax 10/' /etc/ssh/sshd_config
 
           sudo mkdir -p /etc/ssh/sshd_config.d
-          cat << 'EOF' | sudo tee /etc/ssh/sshd_config.d/99-custom.conf
-          PasswordAuthentication yes
-          AllowTcpForwarding yes
-          GatewayPorts yes
-          PermitTunnel yes
-          TCPKeepAlive yes
-          ClientAliveInterval 15
-          ClientAliveCountMax 10
-          UseDNS no
-          GSSAPIAuthentication no
-          Compression no
-          MaxStartups 100:30:200
-          EOF
+          printf '%s\n' \
+            'PasswordAuthentication yes' \
+            'AllowTcpForwarding yes' \
+            'GatewayPorts yes' \
+            'PermitTunnel yes' \
+            'TCPKeepAlive yes' \
+            'ClientAliveInterval 15' \
+            'ClientAliveCountMax 10' \
+            'UseDNS no' \
+            'GSSAPIAuthentication no' \
+            'Compression no' \
+            'MaxStartups 100:30:200' \
+            | sudo tee /etc/ssh/sshd_config.d/99-custom.conf > /dev/null
 
-          sudo systemctl restart ssh || sudo service ssh restart
-
-          # SSH pre-auth banner — shown to every client before they type credentials.
-          # The proxy's X-Server-Info header carries the live countdown;
-          # this banner shows the absolute start time for SSH terminal users.
+          # Pre-auth SSH banner
           START_TIME=$(date '+%Y-%m-%d %H:%M UTC')
           SHUTDOWN_TIME=$(date -d '+6 hours' '+%Y-%m-%d %H:%M UTC')
-          sudo tee /etc/ssh/banner > /dev/null << BANNER
-╔══════════════════════════════════════════════════╗
-║         Made By Talha ❤️  — WS-SSH Tunnel        ║
-║                                                  ║
-║  Server started : $START_TIME           ║
-║  Auto-restart   : $SHUTDOWN_TIME        ║
-╚══════════════════════════════════════════════════╝
-BANNER
-          echo "Banner /etc/ssh/banner" | sudo tee -a /etc/ssh/sshd_config.d/99-custom.conf > /dev/null
+          printf '╔══════════════════════════════════════════════════╗\n' | sudo tee /etc/ssh/banner > /dev/null
+          printf '║         Made By Talha ❤️  — WS-SSH Tunnel        ║\n' | sudo tee -a /etc/ssh/banner > /dev/null
+          printf '║                                                  ║\n' | sudo tee -a /etc/ssh/banner > /dev/null
+          printf "║  Server started : %-30s║\n" "$START_TIME" | sudo tee -a /etc/ssh/banner > /dev/null
+          printf "║  Auto-restart   : %-30s║\n" "$SHUTDOWN_TIME" | sudo tee -a /etc/ssh/banner > /dev/null
+          printf '╚══════════════════════════════════════════════════╝\n' | sudo tee -a /etc/ssh/banner > /dev/null
 
-          # MOTD — shown after successful login
-          sudo tee /etc/motd > /dev/null << MOTD
+          echo 'Banner /etc/ssh/banner' | sudo tee -a /etc/ssh/sshd_config.d/99-custom.conf > /dev/null
 
-  Made By Talha ❤️
-  Tunnel started : $START_TIME
-  Auto-restart   : $SHUTDOWN_TIME
-  Stay connected. Enjoy the speed.
+          # MOTD (post-login)
+          printf "\n  Made By Talha ❤️\n  Tunnel started : %s\n  Auto-restart   : %s\n  Stay connected. Enjoy the speed.\n\n" \
+            "$START_TIME" "$SHUTDOWN_TIME" | sudo tee /etc/motd > /dev/null
 
-MOTD
           sudo systemctl restart ssh || sudo service ssh restart
-
-
-          # Abort if SSH_PASSWORD secret is not set
-          if [ -z "$SSH_PASS" ]; then
-            echo "ERROR: SSH_PASSWORD secret is not set. Add it under Settings > Secrets > Actions."
-            exit 1
-          fi
 
           SSH_USER="vpnuser"
           sudo useradd -m -s /bin/bash "$SSH_USER" 2>/dev/null || true
@@ -106,39 +121,26 @@ MOTD
           sudo usermod -aG sudo "$SSH_USER"
           echo "SSH user created."
 
-      - name: Tune TCP Stack for High-Throughput / High-Latency (BDP Optimized)
+      # ── TCP tuning ──────────────────────────────────────────────────────────
+      - name: Tune TCP Stack (BDP Optimized for High-Latency Links)
         run: |
-          # Max socket buffer: 16MB (allows auto-tuning up to full BDP)
           sudo sysctl -w net.core.rmem_max=16777216
           sudo sysctl -w net.core.wmem_max=16777216
-
-          # TCP auto-tuning range: min=4KB, default=2MB, max=16MB
           sudo sysctl -w net.ipv4.tcp_rmem="4096 2097152 16777216"
           sudo sysctl -w net.ipv4.tcp_wmem="4096 2097152 16777216"
-
-          # BBR congestion control — built for high-latency, high-BDP links
           sudo modprobe tcp_bbr 2>/dev/null || true
           sudo sysctl -w net.ipv4.tcp_congestion_control=bbr || true
-
-          # TCP Fast Open: saves 1 full RTT on new connections
           sudo sysctl -w net.ipv4.tcp_fastopen=3
-
-          # Disable delayed ACK
           sudo sysctl -w net.ipv4.tcp_low_latency=1 || true
-
-          # Increase backlog to absorb bursts
           sudo sysctl -w net.core.netdev_max_backlog=5000
           sudo sysctl -w net.core.somaxconn=4096
-
-          # Disable TCP slow-start after idle — keeps window open on bursty 4G
           sudo sysctl -w net.ipv4.tcp_slow_start_after_idle=0
+          echo "BBR: $(cat /proc/sys/net/ipv4/tcp_congestion_control)"
 
-          echo "BBR active: $(cat /proc/sys/net/ipv4/tcp_congestion_control)"
-
+      # ── WebSocket proxy ─────────────────────────────────────────────────────
       - name: Start WebSocket Bridge (Go Zero-Copy Proxy)
         run: |
           sudo fuser -k 80/tcp 2>/dev/null || true
-
           if command -v go &>/dev/null && [ -f proxy.go ]; then
             go build -o proxy_bin proxy.go
             sudo ./proxy_bin 80 22 > /dev/null 2>&1 &
@@ -149,33 +151,26 @@ MOTD
           sleep 2
           sudo ss -tulpn | grep ':80' || true
 
+      # ── Cloudflare tunnel ───────────────────────────────────────────────────
       - name: Start Cloudflare Tunnel
         run: |
-          TOKEN="${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}"
-          if [ -n "$TOKEN" ]; then
-            cloudflared tunnel run --token "$TOKEN" > /dev/null 2>&1 &
+          CF_TOKEN="${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}"
+          if [ -n "$CF_TOKEN" ]; then
+            cloudflared tunnel run --token "$CF_TOKEN" > /dev/null 2>&1 &
             sleep 8
             CUSTOM="${{ secrets.CUSTOM_DOMAIN }}"
-            if [ -n "$CUSTOM" ]; then
-              DOMAIN="$CUSTOM"
-            else
-              DOMAIN="your-configured-cloudflare-domain"
-            fi
+            DOMAIN="${CUSTOM:-your-configured-cloudflare-domain}"
             echo "DOMAIN=$DOMAIN" >> $GITHUB_ENV
           else
             cloudflared tunnel --url http://127.0.0.1:80 > cf_tunnel.log 2>&1 &
-
             for i in $(seq 1 30); do
               CF_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' cf_tunnel.log | head -n 1)
-              if [ -n "$CF_URL" ]; then break; fi
+              [ -n "$CF_URL" ] && break
               sleep 1
             done
-
             if [ -z "$CF_URL" ]; then
-              echo "Failed to obtain trycloudflare URL"
-              exit 1
+              echo "Failed to obtain trycloudflare URL"; exit 1
             fi
-
             DOMAIN=$(echo "$CF_URL" | sed 's|https://||')
             echo "DOMAIN=$DOMAIN" >> $GITHUB_ENV
 
@@ -188,14 +183,34 @@ MOTD
           fi
 
       - name: Tunnel Ready
-        run: |
-          echo "Tunnel is live on domain: ${{ env.DOMAIN }}"
+        run: echo "Tunnel live on ${{ env.DOMAIN }}"
 
-      - name: Keep Alive
+      # ── Keep alive + self-restart ────────────────────────────────────────────
+      # Sleep 5h50m, then trigger a fresh run if none is already queued/running.
+      # This keeps the tunnel perpetually alive with zero manual intervention.
+      - name: Keep Alive + Auto-Restart
         run: |
-          HOURS="${{ github.event.inputs.duration_hours || '6' }}"
-          SECONDS=$(( HOURS * 3600 ))
-          if [ $SECONDS -gt 21600 ] || [ $SECONDS -le 0 ]; then
-            SECONDS=21600
+          REPO="${{ github.repository }}"
+          WORKFLOW="test-v2ray.yml"
+
+          echo "Sleeping 5h 50m before scheduling restart check..."
+          sleep 21000  # 5 hours 50 minutes = 21000 seconds
+
+          echo "Checking for already-running or queued runs..."
+          ACTIVE=$(gh api "repos/$REPO/actions/workflows/$WORKFLOW/runs?per_page=10" \
+            --jq '[.workflow_runs[] | select(.status=="in_progress" or .status=="queued")] | length')
+
+          echo "Active/queued runs found: $ACTIVE"
+
+          if [ "$ACTIVE" -ge 2 ]; then
+            echo "A replacement run is already running/queued — skipping trigger."
+          else
+            echo "No replacement queued — triggering a new run..."
+            gh api -X POST "repos/$REPO/actions/workflows/$WORKFLOW/dispatches" \
+              -f ref=main \
+              -f 'inputs[duration_hours]=6'
+            echo "New run triggered successfully."
           fi
-          sleep $SECONDS
+
+          echo "Sleeping remaining 10 minutes..."
+          sleep 600
