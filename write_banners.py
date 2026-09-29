@@ -1,27 +1,28 @@
 #!/usr/bin/env python3
 """
-Writes the SSH pre-auth banner and ANSI-colored MOTD.
-Usage: python3 write_banners.py "29 Sep 2026 04:01 PKT" "29 Sep 2026 10:01 PKT"
+Writes the SSH pre-auth banner (HTML formatted for OpenTunnel / HTTP Custom / NetMod) and ANSI MOTD.
+Usage: python3 write_banners.py "29 Sep 2026 11:47 PKT" "29 Sep 2026 17:47 PKT"
 """
 import sys
 
-start    = sys.argv[1]
-shutdown = sys.argv[2]
+start    = sys.argv[1] if len(sys.argv) > 1 else "Active"
+shutdown = sys.argv[2] if len(sys.argv) > 2 else "6 Hours"
 
-# ── Pre-auth banner — plain ASCII (OpenSSH strips ANSI codes) ────────────────
-banner = (
-    "\n"
-    "  +=======================================================+\n"
-    "  |       Made By Talha  -  WS-SSH Tunnel               |\n"
-    "  +=======================================================+\n"
-    f"  |  Started  : {start:<38}|\n"
-    f"  |  Restarts : {shutdown:<38}|\n"
-    "  +=======================================================+\n"
-    "  |  Stay connected. Zero logs. Full speed ahead.        |\n"
-    "  +=======================================================+\n"
-    "\n"
-)
-with open("/etc/ssh/banner", "w") as f:
+# ── Pre-auth banner — HTML styled for mobile tunnel apps (OpenTunnel / HTTP Custom / NetMod) ──
+banner = f"""<div style="text-align: left; font-family: monospace; padding: 15px; background-color: #0d1117; color: #c9d1d9; border-left: 5px solid #58a6ff; line-height: 1.6; font-size: 14px; border-radius: 6px; border: 1px solid #30363d; margin: 10px 0;">
+  <font color="#ffffff">[✦] STATUS: </font><font color="#76ff03"><b>ACTIVE SERVER</b></font><br>
+  <font color="#c9d1d9">-----------------------------------</font><br>
+  File By : <span style="color: #58a6ff; font-weight: bold; font-size: 1.2em; text-shadow: 0 0 5px #58a6ff;">Talha XD</span><br>
+  <font color="#c9d1d9">-----------------------------------</font><br>
+  <font color="#ffffff">[✓]</font> Protocol: <font color="#ffd600">SSH WebSocket</font><br>
+  <font color="#ffffff">[✓]</font> Started  : <font color="#00e5ff">{start}</font><br>
+  <font color="#ffffff">[✓]</font> Restarts : <font color="#ffab00">{shutdown}</font><br>
+  <font color="#c9d1d9">-----------------------------------</font><br>
+  <font color="#ff1744"><b>[!] NO DDOS | NO TORRENT | ZERO LOGS</b></font>
+</div>
+"""
+
+with open("/etc/ssh/banner", "w", encoding="utf-8") as f:
     f.write(banner)
 print("SSH banner written.")
 
@@ -45,6 +46,6 @@ motd = (
     f"{C}  +========================================================+{R}\n"
     "\n"
 )
-with open("/etc/motd", "w") as f:
+with open("/etc/motd", "w", encoding="utf-8") as f:
     f.write(motd)
 print("MOTD written.")
