@@ -12,9 +12,16 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 )
 
 const wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+// maxUptimeHours is the GitHub Actions job timeout — used to compute time remaining.
+const maxUptimeHours = 6
+
+// startTime is recorded once at process start; all connections share it.
+var startTime = time.Now()
 
 func computeAcceptKey(secKey string) string {
 	h := sha1.New()
@@ -22,14 +29,27 @@ func computeAcceptKey(secKey string) string {
 	return base64.StdEncoding.EncodeToString(h.Sum(nil))
 }
 
+// serverBanner builds the human-readable uptime/restart message injected
+// into every WebSocket 101 upgrade response as a custom HTTP header.
+// Clients that surface response headers (e.g. download-engine) will show it.
+func serverBanner() string {
+	elapsed := time.Since(startTime)
+	remaining := time.Duration(maxUptimeHours)*time.Hour - elapsed
+	if remaining < 0 {
+		remaining = 0
+	}
+	h := int(remaining.Hours())
+	m := int(remaining.Minutes()) % 60
+	return fmt.Sprintf("Made By Talha \u2764\ufe0f | Restarts in %dh %02dm", h, m)
+}
+
 // splice copies src -> dst using io.Copy.
 // On Linux, Go's net.TCPConn.ReadFrom triggers splice(2) when src is also a
 // *net.TCPConn — data moves entirely in kernel space, zero userspace copies.
-// This is the single biggest throughput multiplier for a TCP relay.
 func splice(dst, src *net.TCPConn, wg *sync.WaitGroup) {
 	defer wg.Done()
-	io.Copy(dst, src) //nolint — error intentionally ignored; connection drop is normal exit
-	dst.CloseWrite()  // half-close so peer can drain its remaining data
+	io.Copy(dst, src)
+	dst.CloseWrite()
 }
 
 func handleClient(conn net.Conn, targetAddr string) {
@@ -56,7 +76,12 @@ func handleClient(conn net.Conn, targetAddr string) {
 	if secKey != "" {
 		resp.WriteString(fmt.Sprintf("Sec-WebSocket-Accept: %s\r\n", computeAcceptKey(secKey)))
 	}
+	// Custom banner headers — visible in WebSocket handshake responses.
+	// Safe to add: RFC 6455 allows arbitrary headers in the 101 response.
+	resp.WriteString(fmt.Sprintf("X-Server-Info: %s\r\n", serverBanner()))
+	resp.WriteString(fmt.Sprintf("X-Server-Uptime: %.0fs\r\n", time.Since(startTime).Seconds()))
 	resp.WriteString("\r\n")
+
 	if _, err := clientConn.Write(resp.Bytes()); err != nil {
 		return
 	}
@@ -75,8 +100,7 @@ func handleClient(conn net.Conn, targetAddr string) {
 	targetConn.SetKeepAlivePeriod(10e9)
 
 	// Drain bytes the bufio reader pre-fetched beyond the HTTP headers.
-	// Must reach the SSH target before the splice loop starts, or the
-	// SSH handshake will be corrupted.
+	// Must reach the SSH target before the splice loop starts.
 	if n := hdrBuf.Buffered(); n > 0 {
 		leftover := make([]byte, n)
 		io.ReadFull(hdrBuf, leftover)
@@ -88,7 +112,7 @@ func handleClient(conn net.Conn, targetAddr string) {
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go splice(targetConn, clientConn, &wg) // client  -> SSH  (splice)
+	go splice(targetConn, clientConn, &wg) // client -> SSH  (splice)
 	go splice(clientConn, targetConn, &wg) // SSH -> client  (splice)
 	wg.Wait()
 }
@@ -110,7 +134,8 @@ func main() {
 		os.Exit(1)
 	}
 	defer listener.Close()
-	fmt.Printf("[WS-ePRO Go] Listening on 0.0.0.0:%s -> %s (splice/zero-copy mode)\n", listenPort, targetAddr)
+	fmt.Printf("[WS-ePRO Go] Listening on 0.0.0.0:%s -> %s | %s\n",
+		listenPort, targetAddr, serverBanner())
 
 	for {
 		conn, err := listener.Accept()

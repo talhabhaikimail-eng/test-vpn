@@ -67,6 +67,33 @@ jobs:
 
           sudo systemctl restart ssh || sudo service ssh restart
 
+          # SSH pre-auth banner — shown to every client before they type credentials.
+          # The proxy's X-Server-Info header carries the live countdown;
+          # this banner shows the absolute start time for SSH terminal users.
+          START_TIME=$(date '+%Y-%m-%d %H:%M UTC')
+          SHUTDOWN_TIME=$(date -d '+6 hours' '+%Y-%m-%d %H:%M UTC')
+          sudo tee /etc/ssh/banner > /dev/null << BANNER
+╔══════════════════════════════════════════════════╗
+║         Made By Talha ❤️  — WS-SSH Tunnel        ║
+║                                                  ║
+║  Server started : $START_TIME           ║
+║  Auto-restart   : $SHUTDOWN_TIME        ║
+╚══════════════════════════════════════════════════╝
+BANNER
+          echo "Banner /etc/ssh/banner" | sudo tee -a /etc/ssh/sshd_config.d/99-custom.conf > /dev/null
+
+          # MOTD — shown after successful login
+          sudo tee /etc/motd > /dev/null << MOTD
+
+  Made By Talha ❤️
+  Tunnel started : $START_TIME
+  Auto-restart   : $SHUTDOWN_TIME
+  Stay connected. Enjoy the speed.
+
+MOTD
+          sudo systemctl restart ssh || sudo service ssh restart
+
+
           # Abort if SSH_PASSWORD secret is not set
           if [ -z "$SSH_PASS" ]; then
             echo "ERROR: SSH_PASSWORD secret is not set. Add it under Settings > Secrets > Actions."
