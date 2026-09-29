@@ -11,9 +11,18 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 )
 
 const wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+// 32KB pool — large enough for SSH bulk transfers, reused across connections.
+var bufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 32*1024)
+		return &b
+	},
+}
 
 func computeAcceptKey(secKey string) string {
 	h := sha1.New()
@@ -21,8 +30,13 @@ func computeAcceptKey(secKey string) string {
 	return base64.StdEncoding.EncodeToString(h.Sum(nil))
 }
 
-func forward(dst io.Writer, src io.Reader, done chan struct{}) {
-	buf := make([]byte, 32768)
+// pipe copies src -> dst until EOF or error, then half-closes the destination.
+// Uses raw TCPConn reads — no bufio wrapper in the forwarding hot path.
+func pipe(dst, src *net.TCPConn, wg *sync.WaitGroup) {
+	defer wg.Done()
+	bufPtr := bufPool.Get().(*[]byte)
+	defer bufPool.Put(bufPtr)
+	buf := *bufPtr
 	for {
 		nr, err := src.Read(buf)
 		if nr > 0 {
@@ -34,21 +48,22 @@ func forward(dst io.Writer, src io.Reader, done chan struct{}) {
 			break
 		}
 	}
-	if tc, ok := dst.(*net.TCPConn); ok {
-		tc.CloseWrite()
-	}
-	done <- struct{}{}
+	// Half-close: let the peer drain its remaining data instead of RST.
+	dst.CloseWrite()
 }
 
-func handleClient(clientConn net.Conn, targetAddr string) {
-	defer clientConn.Close()
+func handleClient(conn net.Conn, targetAddr string) {
+	defer conn.Close()
 
-	if tc, ok := clientConn.(*net.TCPConn); ok {
-		tc.SetNoDelay(true)
-	}
+	clientConn := conn.(*net.TCPConn)
+	clientConn.SetNoDelay(true)         // Flush every write immediately — no Nagle
+	clientConn.SetKeepAlive(true)
+	clientConn.SetKeepAlivePeriod(10e9) // 10s OS keepalive
 
-	reader := bufio.NewReader(clientConn)
-	req, err := http.ReadRequest(reader)
+	// bufio.Reader is ONLY used to parse HTTP upgrade headers.
+	// It is NOT passed into the forwarding path.
+	hdrReader := bufio.NewReader(clientConn)
+	req, err := http.ReadRequest(hdrReader)
 	if err != nil {
 		return
 	}
@@ -68,25 +83,35 @@ func handleClient(clientConn net.Conn, targetAddr string) {
 		return
 	}
 
-	targetConn, err := net.Dial("tcp", targetAddr)
+	raw, err := net.ResolveTCPAddr("tcp", targetAddr)
+	if err != nil {
+		return
+	}
+	targetConn, err := net.DialTCP("tcp", nil, raw)
 	if err != nil {
 		return
 	}
 	defer targetConn.Close()
+	targetConn.SetNoDelay(true)    // Critical: no Nagle on SSH side either
+	targetConn.SetKeepAlive(true)
+	targetConn.SetKeepAlivePeriod(10e9)
 
-	if tc, ok := targetConn.(*net.TCPConn); ok {
-		tc.SetNoDelay(true)
+	// Flush any bytes the bufio.Reader already pulled off the wire.
+	// Skipping this loses the first chunk of the SSH handshake.
+	if n := hdrReader.Buffered(); n > 0 {
+		leftover := make([]byte, n)
+		io.ReadFull(hdrReader, leftover)
+		if _, err := targetConn.Write(leftover); err != nil {
+			return
+		}
 	}
+	// hdrReader discarded here — raw TCPConn from this point forward.
 
-	done := make(chan struct{}, 2)
-
-	// Stream from reader (which contains any buffered HTTP leftover bytes + clientConn) to targetConn
-	go forward(targetConn, reader, done)
-
-	// Stream directly from targetConn (SSH) to clientConn
-	go forward(clientConn, targetConn, done)
-
-	<-done
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go pipe(targetConn, clientConn, &wg) // client -> SSH
+	go pipe(clientConn, targetConn, &wg) // SSH -> client
+	wg.Wait()
 }
 
 func main() {
@@ -100,6 +125,8 @@ func main() {
 		targetPort = os.Args[2]
 	}
 
+	targetAddr := "127.0.0.1:" + targetPort
+
 	listener, err := net.Listen("tcp", "0.0.0.0:"+listenPort)
 	if err != nil {
 		fmt.Printf("[WS-ePRO Go] Failed to bind :%s: %v\n", listenPort, err)
@@ -107,14 +134,13 @@ func main() {
 	}
 	defer listener.Close()
 
-	targetAddr := "127.0.0.1:" + targetPort
-	fmt.Printf("[WS-ePRO Go] Listening on 0.0.0.0:%s -> %s (Immediate-Flush Mode)\n", listenPort, targetAddr)
+	fmt.Printf("[WS-ePRO Go] Listening on 0.0.0.0:%s -> %s (zero-buffer mode)\n", listenPort, targetAddr)
 
 	for {
-		clientConn, err := listener.Accept()
+		conn, err := listener.Accept()
 		if err != nil {
 			continue
 		}
-		go handleClient(clientConn, targetAddr)
+		go handleClient(conn, targetAddr)
 	}
 }

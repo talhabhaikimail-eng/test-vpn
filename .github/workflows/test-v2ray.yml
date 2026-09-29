@@ -80,6 +80,16 @@ jobs:
           sudo usermod -aG sudo "$SSH_USER"
           echo "SSH user '$SSH_USER' created successfully."
 
+      - name: Tune TCP Stack for Low Latency
+        run: |
+          # Disable delayed ACK coalescing for minimum per-packet latency
+          sudo sysctl -w net.ipv4.tcp_low_latency=1 || true
+          # Enable TCP Fast Open (client + server) to cut 1 RTT on new connections
+          sudo sysctl -w net.ipv4.tcp_fastopen=3 || true
+          # Increase socket buffer defaults (helps burst throughput without hurting latency)
+          sudo sysctl -w net.core.rmem_default=262144 || true
+          sudo sysctl -w net.core.wmem_default=262144 || true
+
       - name: Start WebSocket Bridge (Go High-Speed Zero-Copy Proxy)
         run: |
           # Kill anything on port 80
