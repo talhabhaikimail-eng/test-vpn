@@ -65,7 +65,7 @@ func tune(c *net.TCPConn) {
 	_ = c.SetNoDelay(true)
 	_ = c.SetKeepAlive(true)
 	_ = c.SetKeepAlivePeriod(keepAlivePeriod)
-	setQuickAck(c)
+	
 }
 
 // pipe copies src -> dst. With both ends *net.TCPConn, io.Copy triggers
