@@ -100,7 +100,7 @@ jobs:
           sudo modprobe tcp_bbr 2>/dev/null || true
           sudo sysctl -w net.ipv4.tcp_congestion_control=bbr || true
           sudo sysctl -w net.ipv4.tcp_fastopen=3
-          sudo sysctl -w net.ipv4.tcp_low_latency=1 || true
+          sudo sysctl -w net.ipv4.tcp_notsent_lowat=16384
           sudo sysctl -w net.core.netdev_max_backlog=5000
           sudo sysctl -w net.core.somaxconn=4096
           sudo sysctl -w net.ipv4.tcp_slow_start_after_idle=0
@@ -125,7 +125,7 @@ jobs:
         run: |
           CF_TOKEN="${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}"
           if [ -n "$CF_TOKEN" ]; then
-            cloudflared tunnel run --token "$CF_TOKEN" > /dev/null 2>&1 &
+            cloudflared tunnel --protocol http2 --ha-connections 1 --edge-ip-version 4 run --token "$CF_TOKEN" > /dev/null 2>&1 &
             sleep 8
             CUSTOM="${{ secrets.CUSTOM_DOMAIN }}"
             DOMAIN="${CUSTOM:-your-configured-cloudflare-domain}"
