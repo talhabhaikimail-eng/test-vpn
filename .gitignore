@@ -1,1 +1,6 @@
 .ai/
+.env
+*.env
+*.exe
+proxy_bin
+proxy_test_bin

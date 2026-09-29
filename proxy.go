@@ -1,19 +1,16 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha1"
 	"encoding/base64"
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net"
-	"net/http"
 	"os/signal"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -21,14 +18,25 @@ import (
 
 const (
 	wsGUID           = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-	maxHeaderBytes   = 16 << 10        // 16 KB — caps slowloris header floods
-	handshakeTimeout = 10 * time.Second
-	dialTimeout      = 5 * time.Second
+	maxHeaderBytes   = 8192
+	handshakeTimeout = 5 * time.Second
 	keepAlivePeriod  = 15 * time.Second
 	maxUptimeHours   = 6
+	bufSize          = 65536 // 64KB buffer for wire-speed throughput
 )
 
-var startTime = time.Now()
+var (
+	startTime  = time.Now()
+	pktZone    = time.FixedZone("PKT", 5*60*60)
+	startedStr = startTime.In(pktZone).Format("02 Jan 2006 15:04 PKT")
+
+	bufPool = sync.Pool{
+		New: func() any {
+			b := make([]byte, bufSize)
+			return &b
+		},
+	}
+)
 
 // serverBanner returns the live countdown header value, PKT-localised.
 func serverBanner() string {
@@ -37,16 +45,20 @@ func serverBanner() string {
 	if remaining < 0 {
 		remaining = 0
 	}
-	pkt := time.FixedZone("PKT", 5*60*60)
-	started := startTime.In(pkt).Format("02 Jan 2006 15:04 PKT")
 	return fmt.Sprintf("Made By Talha \u2764 | Started: %s | Restarts in %dh %02dm",
-		started, int(remaining.Hours()), int(remaining.Minutes())%60)
+		startedStr, int(remaining.Hours()), int(remaining.Minutes())%60)
 }
 
-// acceptKey computes the Sec-WebSocket-Accept value.
-func acceptKey(secKey string) string {
-	sum := sha1.Sum([]byte(strings.TrimSpace(secKey) + wsGUID)) // sha1.Sum: no heap alloc
-	return base64.StdEncoding.EncodeToString(sum[:])
+// acceptKey computes the Sec-WebSocket-Accept value with zero heap allocation.
+func acceptKey(secKey []byte) string {
+	k := bytes.TrimSpace(secKey)
+	var in [128]byte
+	n := copy(in[:], k)
+	n += copy(in[n:], wsGUID)
+	sum := sha1.Sum(in[:n])
+	var out [28]byte
+	base64.StdEncoding.Encode(out[:], sum[:])
+	return string(out[:])
 }
 
 // tune sets TCP_NODELAY + keepalive on a TCPConn.
@@ -56,75 +68,116 @@ func tune(c *net.TCPConn) {
 	_ = c.SetKeepAlivePeriod(keepAlivePeriod)
 }
 
-// pipe copies src -> dst. With both ends *net.TCPConn, io.Copy triggers
-// splice(2) on Linux — zero userspace copies, kernel-space only.
-func pipe(dst, src *net.TCPConn, wg *sync.WaitGroup) {
-	defer wg.Done()
-	_, _ = io.Copy(dst, src)
-	_ = dst.CloseWrite() // half-close so the peer can drain its buffer
+// forward copies src -> dst using pooled 64KB buffer for zero-lag streaming and line-rate speed.
+func forward(dst, src *net.TCPConn, done chan<- struct{}) {
+	defer func() {
+		_ = dst.CloseWrite()
+		done <- struct{}{}
+	}()
+
+	bPtr := bufPool.Get().(*[]byte)
+	defer bufPool.Put(bPtr)
+	buf := *bPtr
+
+	for {
+		nr, err := src.Read(buf)
+		if nr > 0 {
+			if _, ew := dst.Write(buf[:nr]); ew != nil {
+				break
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
 }
 
-func handleClient(client *net.TCPConn, target string) {
+func handleClient(client *net.TCPConn, targetAddr *net.TCPAddr) {
 	defer client.Close()
 	tune(client)
 
-	// ── Handshake phase ──────────────────────────────────────────────────────
-	// Read deadline prevents slowloris (client connects but never sends).
-	// LimitReader caps header size so we can't be OOM'd by a huge request.
+	// ── 1. Read HTTP Handshake with fast zero-alloc scan ─────────────────────
 	_ = client.SetReadDeadline(time.Now().Add(handshakeTimeout))
-	br := bufio.NewReaderSize(io.LimitReader(client, maxHeaderBytes), 4096)
-	req, err := http.ReadRequest(br)
-	if err != nil {
-		return // deadline hit or bad request — just drop it
-	}
-	secKey := req.Header.Get("Sec-WebSocket-Key")
 
-	// ── Dial upstream BEFORE sending 101 ────────────────────────────────────
-	// If SSH is down we return 502 instead of a broken tunnel.
-	d := net.Dialer{Timeout: dialTimeout}
-	c, err := d.Dial("tcp", target)
-	if err != nil {
-		log.Printf("dial %s: %v", target, err)
-		_, _ = client.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+	headerBuf := make([]byte, maxHeaderBytes)
+	n := 0
+	headerEnd := -1
+
+	for n < maxHeaderBytes {
+		nr, err := client.Read(headerBuf[n:])
+		if err != nil {
+			return
+		}
+		n += nr
+		idx := bytes.Index(headerBuf[:n], []byte("\r\n\r\n"))
+		if idx != -1 {
+			headerEnd = idx
+			break
+		}
+	}
+
+	if headerEnd == -1 {
 		return
 	}
-	upstream := c.(*net.TCPConn)
-	defer upstream.Close()
-	tune(upstream)
 
-	// ── Send 101 Switching Protocols ─────────────────────────────────────────
-	var resp strings.Builder
+	headerData := headerBuf[:headerEnd]
+	leftover := headerBuf[headerEnd+4 : n]
+
+	// ── 2. Extract Sec-WebSocket-Key ─────────────────────────────────────────
+	var secKey []byte
+	lines := bytes.Split(headerData, []byte("\r\n"))
+	for _, line := range lines {
+		if len(line) > 18 && bytes.EqualFold(line[:18], []byte("sec-websocket-key:")) {
+			secKey = bytes.TrimSpace(line[18:])
+			break
+		}
+	}
+
+	// ── 3. Send 101 Switching Protocols IMMEDIATELY ─────────────────────────
+	var resp bytes.Buffer
+	resp.Grow(512)
 	resp.WriteString("HTTP/1.1 101 Switching Protocols\r\n")
 	resp.WriteString("Upgrade: websocket\r\n")
 	resp.WriteString("Connection: Upgrade\r\n")
-	if secKey != "" {
-		fmt.Fprintf(&resp, "Sec-WebSocket-Accept: %s\r\n", acceptKey(secKey))
+	if len(secKey) > 0 {
+		resp.WriteString("Sec-WebSocket-Accept: ")
+		resp.WriteString(acceptKey(secKey))
+		resp.WriteString("\r\n")
 	}
-	// Live banner headers — tunnel clients that surface WS response headers see this.
-	fmt.Fprintf(&resp, "X-Server-Info: %s\r\n", serverBanner())
-	fmt.Fprintf(&resp, "X-Server-Uptime: %.0fs\r\n", time.Since(startTime).Seconds())
+	resp.WriteString("X-Server-Info: ")
+	resp.WriteString(serverBanner())
 	resp.WriteString("\r\n")
+	fmt.Fprintf(&resp, "X-Server-Uptime: %.0fs\r\n\r\n", time.Since(startTime).Seconds())
 
-	if _, err := client.Write([]byte(resp.String())); err != nil {
+	if _, err := client.Write(resp.Bytes()); err != nil {
 		return
 	}
-	_ = client.SetReadDeadline(time.Time{}) // clear deadline — data phase is unbounded
+	_ = client.SetReadDeadline(time.Time{}) // clear deadline — streaming phase is unbounded
 
-	// ── Drain bufio pre-read bytes ───────────────────────────────────────────
-	// http.ReadRequest may have pulled bytes beyond the headers into br's
-	// internal buffer. Flush them to upstream before starting splice.
-	if n := br.Buffered(); n > 0 {
-		if _, err := io.CopyN(upstream, br, int64(n)); err != nil {
+	// ── 4. Connect to upstream SSH (pre-resolved target TCP address) ─────────
+	upstream, err := net.DialTCP("tcp", nil, targetAddr)
+	if err != nil {
+		log.Printf("dial %s: %v", targetAddr, err)
+		return
+	}
+	defer upstream.Close()
+	tune(upstream)
+
+	// Send any pre-read leftover bytes to SSH immediately
+	if len(leftover) > 0 {
+		if _, err := upstream.Write(leftover); err != nil {
 			return
 		}
 	}
-	// br is done — raw *net.TCPConn from here, splice path active.
 
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go pipe(upstream, client, &wg) // client  -> SSH
-	go pipe(client, upstream, &wg) // SSH -> client
-	wg.Wait()
+	// ── 5. Full-duplex streaming with immediate teardown on close ───────────
+	done := make(chan struct{}, 2)
+	go forward(upstream, client, done)
+	go forward(client, upstream, done)
+
+	// As soon as EITHER direction closes, unblock and exit.
+	// Defers then immediately close both TCP sockets, unblocking the sibling goroutine.
+	<-done
 }
 
 func main() {
@@ -137,20 +190,26 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	addr, err := net.ResolveTCPAddr("tcp", *listen)
+	listenAddr, err := net.ResolveTCPAddr("tcp", *listen)
 	if err != nil {
 		log.Fatal(err)
 	}
-	ln, err := net.ListenTCP("tcp", addr) // ListenTCP -> AcceptTCP: no type assertion needed
+
+	targetAddr, err := net.ResolveTCPAddr("tcp", *target)
+	if err != nil {
+		log.Fatalf("resolve target %s: %v", *target, err)
+	}
+
+	ln, err := net.ListenTCP("tcp", listenAddr)
 	if err != nil {
 		log.Fatalf("bind %s: %v", *listen, err)
 	}
 	go func() { <-ctx.Done(); ln.Close() }()
 
-	log.Printf("[WS-ePRO Go] %s -> %s (splice/zero-copy, max-conns=%d)", *listen, *target, *maxConns)
+	log.Printf("[WS-ePRO Go] %s -> %s (Immediate-101 + High-Throughput Buffer, max-conns=%d)", *listen, *target, *maxConns)
 	log.Printf("[WS-ePRO Go] %s", serverBanner())
 
-	sem := make(chan struct{}, *maxConns) // semaphore caps concurrent goroutines
+	sem := make(chan struct{}, *maxConns)
 	var active sync.WaitGroup
 	var backoff time.Duration
 
@@ -158,10 +217,8 @@ func main() {
 		conn, err := ln.AcceptTCP()
 		if err != nil {
 			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
-				break // clean shutdown
+				break
 			}
-			// Transient error (e.g. EMFILE — too many open files).
-			// Back off exponentially instead of spinning the CPU at 100%.
 			if backoff == 0 {
 				backoff = 5 * time.Millisecond
 			} else if backoff *= 2; backoff > time.Second {
@@ -174,7 +231,7 @@ func main() {
 		backoff = 0
 
 		select {
-		case sem <- struct{}{}: // slot acquired
+		case sem <- struct{}{}:
 		default:
 			log.Printf("at capacity (%d), dropping %s", *maxConns, conn.RemoteAddr())
 			conn.Close()
@@ -185,11 +242,10 @@ func main() {
 		go func(c *net.TCPConn) {
 			defer active.Done()
 			defer func() { <-sem }()
-			handleClient(c, *target)
+			handleClient(c, targetAddr)
 		}(conn)
 	}
 
-	// Drain active connections — up to 10 s before hard exit.
 	log.Println("shutting down, draining active connections (10s max)...")
 	done := make(chan struct{})
 	go func() { active.Wait(); close(done) }()
