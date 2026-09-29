@@ -40,7 +40,8 @@ func serverBanner() string {
 	}
 	h := int(remaining.Hours())
 	m := int(remaining.Minutes()) % 60
-	return fmt.Sprintf("Made By Talha \u2764\ufe0f | Restarts in %dh %02dm", h, m)
+	started := startTime.In(time.FixedZone("PKT", 5*60*60)).Format("02 Jan 2006 15:04 PKT")
+	return fmt.Sprintf("Made By Talha \u2764 | Started: %s | Restarts in %dh %02dm", started, h, m)
 }
 
 // splice copies src -> dst using io.Copy.

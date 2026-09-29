@@ -73,21 +73,14 @@ jobs:
             'MaxStartups 100:30:200' \
             | sudo tee /etc/ssh/sshd_config.d/99-custom.conf > /dev/null
 
-          # Pre-auth SSH banner
-          START_TIME=$(date '+%Y-%m-%d %H:%M UTC')
-          SHUTDOWN_TIME=$(date -d '+6 hours' '+%Y-%m-%d %H:%M UTC')
-          printf '╔══════════════════════════════════════════════════╗\n' | sudo tee /etc/ssh/banner > /dev/null
-          printf '║         Made By Talha ❤️  — WS-SSH Tunnel        ║\n' | sudo tee -a /etc/ssh/banner > /dev/null
-          printf '║                                                  ║\n' | sudo tee -a /etc/ssh/banner > /dev/null
-          printf "║  Server started : %-30s║\n" "$START_TIME" | sudo tee -a /etc/ssh/banner > /dev/null
-          printf "║  Auto-restart   : %-30s║\n" "$SHUTDOWN_TIME" | sudo tee -a /etc/ssh/banner > /dev/null
-          printf '╚══════════════════════════════════════════════════╝\n' | sudo tee -a /etc/ssh/banner > /dev/null
+          # All times in Asia/Karachi (PKT = UTC+5)
+          START_TIME=$(TZ='Asia/Karachi' date '+%d %b %Y %H:%M PKT')
+          SHUTDOWN_TIME=$(TZ='Asia/Karachi' date -d '+6 hours' '+%d %b %Y %H:%M PKT')
 
+          # Write SSH pre-auth banner (plain ASCII) + ANSI MOTD via external script.
+          # Keeps YAML clean — no pipe characters or escape codes inside the workflow.
+          sudo python3 write_banners.py "$START_TIME" "$SHUTDOWN_TIME"
           echo 'Banner /etc/ssh/banner' | sudo tee -a /etc/ssh/sshd_config.d/99-custom.conf > /dev/null
-
-          # MOTD (post-login)
-          printf "\n  Made By Talha ❤️\n  Tunnel started : %s\n  Auto-restart   : %s\n  Stay connected. Enjoy the speed.\n\n" \
-            "$START_TIME" "$SHUTDOWN_TIME" | sudo tee /etc/motd > /dev/null
 
           sudo systemctl restart ssh || sudo service ssh restart
 
