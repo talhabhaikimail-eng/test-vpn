@@ -80,15 +80,41 @@ jobs:
           sudo usermod -aG sudo "$SSH_USER"
           echo "SSH user '$SSH_USER' created successfully."
 
-      - name: Tune TCP Stack for Low Latency
+      - name: Tune TCP Stack for High-Throughput / High-Latency (BDP Optimized)
         run: |
-          # Disable delayed ACK coalescing for minimum per-packet latency
+          # --- BDP math for Pakistan (334ms RTT) ---
+          # To hit 50 Mbps you need: 50Mbps * 0.334s = ~2MB in-flight
+          # To hit 100 Mbps you need: ~4MB in-flight
+          # Default Linux buffers (87KB) cap you at ~2 Mbps at 334ms. Fix:
+
+          # Max socket buffer: 16MB (allows auto-tuning up to full BDP)
+          sudo sysctl -w net.core.rmem_max=16777216
+          sudo sysctl -w net.core.wmem_max=16777216
+
+          # TCP auto-tuning range: min=4KB, default=2MB, max=16MB
+          sudo sysctl -w net.ipv4.tcp_rmem="4096 2097152 16777216"
+          sudo sysctl -w net.ipv4.tcp_wmem="4096 2097152 16777216"
+
+          # BBR congestion control — built for high-latency, high-BDP links.
+          # CUBIC (default) backs off aggressively at 334ms; BBR does not.
+          sudo modprobe tcp_bbr 2>/dev/null || true
+          sudo sysctl -w net.ipv4.tcp_congestion_control=bbr || true
+
+          # TCP Fast Open: saves 1 full RTT (334ms!) on new connections
+          sudo sysctl -w net.ipv4.tcp_fastopen=3
+
+          # Disable delayed ACK — sends ACKs immediately, not batched every 40ms
           sudo sysctl -w net.ipv4.tcp_low_latency=1 || true
-          # Enable TCP Fast Open (client + server) to cut 1 RTT on new connections
-          sudo sysctl -w net.ipv4.tcp_fastopen=3 || true
-          # Increase socket buffer defaults (helps burst throughput without hurting latency)
-          sudo sysctl -w net.core.rmem_default=262144 || true
-          sudo sysctl -w net.core.wmem_default=262144 || true
+
+          # Increase backlog to absorb bursts without dropping SYN packets
+          sudo sysctl -w net.core.netdev_max_backlog=5000
+          sudo sysctl -w net.core.somaxconn=4096
+
+          # Disable TCP slow-start after idle — keeps window open on bursty 4G
+          sudo sysctl -w net.ipv4.tcp_slow_start_after_idle=0
+
+          echo "TCP tuning applied. BBR: $(cat /proc/sys/net/ipv4/tcp_congestion_control)"
+
 
       - name: Start WebSocket Bridge (Go High-Speed Zero-Copy Proxy)
         run: |
