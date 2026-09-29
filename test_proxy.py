@@ -265,6 +265,10 @@ def probe_proxy(target_host, connect_host, port, use_tls, timeout=5.0, hold_seco
         metrics["total_ms"] = (time.perf_counter() - t_start) * 1000.0
     finally:
         try:
+            s.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        try:
             s.close()
         except Exception:
             pass
