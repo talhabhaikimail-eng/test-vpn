@@ -112,7 +112,7 @@ jobs:
           sudo fuser -k 80/tcp 2>/dev/null || true
           if command -v go &>/dev/null && [ -f proxy.go ]; then
             go build -o proxy_bin proxy.go
-            sudo ./proxy_bin 80 22 > /dev/null 2>&1 &
+            sudo ./proxy_bin --listen 0.0.0.0:80 --target 127.0.0.1:22 > /dev/null 2>&1 &
           else
             chmod +x proxy.py
             sudo python3 proxy.py 80 22 > /dev/null 2>&1 &
