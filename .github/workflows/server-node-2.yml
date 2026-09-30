@@ -124,15 +124,15 @@ jobs:
       # ── Cloudflare tunnel ───────────────────────────────────────────────────
       - name: Start Cloudflare Tunnel
         run: |
-          MODE="${{ github.event.inputs.tunnel_mode || 'quick' }}"
+          MODE="${{ github.event.inputs.tunnel_mode || 'token' }}"
           CF_TOKEN_2="${{ secrets.CLOUDFLARE_TUNNEL_TOKEN_2 || secrets.CLOUDFLARE_TUNNEL_TOKEN }}"
 
           if [ "$MODE" = "token" ] && [ -n "$CF_TOKEN_2" ]; then
-            echo "Starting named Cloudflare tunnel with token (HA Connector on tunnel.ufone-claim.site)..."
+            echo "Starting named Cloudflare tunnel with token (Dedicated Server 2 on tunnel2.ufone-claim.site)..."
             cloudflared tunnel --protocol quic run --token "$CF_TOKEN_2" > cf_tunnel.log 2>&1 &
             sleep 8
-            CUSTOM="${{ secrets.CUSTOM_DOMAIN }}"
-            DOMAIN="${CUSTOM:-tunnel.ufone-claim.site}"
+            CUSTOM="${{ secrets.CUSTOM_DOMAIN_2 || secrets.CUSTOM_DOMAIN }}"
+            DOMAIN="${CUSTOM:-tunnel2.ufone-claim.site}"
             echo "DOMAIN=$DOMAIN" >> $GITHUB_ENV
           else
             echo "Starting Cloudflare quick tunnel (trycloudflare.com)..."
@@ -230,7 +230,11 @@ jobs:
 
             if ! pgrep -f "cloudflared" > /dev/null; then
               echo "[WATCHDOG] Local cloudflared died! Restarting..."
-              cloudflared tunnel --url http://127.0.0.1:80 > cf_tunnel.log 2>&1 &
+              if [ "$MODE" = "token" ] && [ -n "$CF_TOKEN_2" ]; then
+                cloudflared tunnel --protocol quic run --token "$CF_TOKEN_2" > cf_tunnel.log 2>&1 &
+              else
+                cloudflared tunnel --url http://127.0.0.1:80 > cf_tunnel.log 2>&1 &
+              fi
             fi
 
             # 2. Peer Cross-Check (Every 3 minutes = 180 seconds)
