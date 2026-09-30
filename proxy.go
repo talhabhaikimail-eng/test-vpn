@@ -29,6 +29,7 @@ var (
 	startTime  = time.Now()
 	pktZone    = time.FixedZone("PKT", 5*60*60)
 	startedStr = startTime.In(pktZone).Format("02 Jan 2006 15:04 PKT")
+	nodeName   = "Server 1"
 
 	bufPool = sync.Pool{
 		New: func() any {
@@ -45,8 +46,8 @@ func serverBanner() string {
 	if remaining < 0 {
 		remaining = 0
 	}
-	return fmt.Sprintf("Made By Talha \u2764 | Started: %s | Restarts in %dh %02dm",
-		startedStr, int(remaining.Hours()), int(remaining.Minutes())%60)
+	return fmt.Sprintf("[%s] Made By Talha \u2764 | Started: %s | Restarts in %dh %02dm",
+		nodeName, startedStr, int(remaining.Hours()), int(remaining.Minutes())%60)
 }
 
 // acceptKey computes the Sec-WebSocket-Accept value with zero heap allocation.
@@ -181,10 +182,12 @@ func handleClient(client *net.TCPConn, targetAddr *net.TCPAddr) {
 }
 
 func main() {
-	listen   := flag.String("listen",    "0.0.0.0:80",    "listen address")
-	target   := flag.String("target",   "127.0.0.1:22",  "upstream SSH address")
-	maxConns := flag.Int("max-conns",   1024,             "max concurrent connections")
+	listen     := flag.String("listen",    "0.0.0.0:80",    "listen address")
+	target     := flag.String("target",   "127.0.0.1:22",  "upstream SSH address")
+	maxConns   := flag.Int("max-conns",   1024,             "max concurrent connections")
+	serverName := flag.String("name",     "Server 1",       "server instance name (e.g. Server 1 or Server 2)")
 	flag.Parse()
+	nodeName = *serverName
 
 	// Graceful shutdown on SIGINT / SIGTERM.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

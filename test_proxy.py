@@ -69,22 +69,63 @@ def load_env():
 # Load .env before initializing defaults
 load_env()
 
-def get_default_host():
-    """Reads TUNNEL_HOST from env, or live_domain.txt. Returns empty string if not found."""
+def get_domain_candidates():
+    """Returns list of domains found in live_domain.txt, live_domain_secondary.txt, or environment."""
+    candidates = []
     env_host = os.environ.get("TUNNEL_HOST") or os.environ.get("HOST")
     if env_host and env_host.strip():
-        return env_host.strip()
+        candidates.append(env_host.strip())
+
     script_dir = os.path.dirname(os.path.abspath(__file__))
     domain_file = os.path.join(script_dir, "live_domain.txt")
     if os.path.isfile(domain_file):
         try:
             with open(domain_file, "r", encoding="utf-8") as f:
-                content = f.read().strip()
-                if content:
-                    return content
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        if "=" in line:
+                            line = line.split("=", 1)[1].strip()
+                        elif ":" in line and not line.startswith("http"):
+                            line = line.split(":", 1)[1].strip()
+                        line = line.replace("https://", "").replace("http://", "").split("/")[0].strip()
+                        if line and line not in candidates:
+                            candidates.append(line)
         except Exception:
             pass
-    return ""
+
+    sec_file = os.path.join(script_dir, "live_domain_secondary.txt")
+    if os.path.isfile(sec_file):
+        try:
+            with open(sec_file, "r", encoding="utf-8") as f:
+                sec = f.read().strip().replace("https://", "").replace("http://", "").split("/")[0].strip()
+                if sec and sec not in candidates:
+                    candidates.append(sec)
+        except Exception:
+            pass
+
+    return candidates
+
+def get_default_host(server_idx=1):
+    """Reads TUNNEL_HOST from env, or live_domain.txt (server_idx: 1=Primary, 2=Secondary)."""
+    candidates = get_domain_candidates()
+    if not candidates:
+        return ""
+    if server_idx == 2:
+        if len(candidates) >= 2:
+            return candidates[1]
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        sec_file = os.path.join(script_dir, "live_domain_secondary.txt")
+        if os.path.isfile(sec_file):
+            try:
+                with open(sec_file, "r", encoding="utf-8") as f:
+                    sec = f.read().strip().replace("https://", "").replace("http://", "").split("/")[0].strip()
+                    if sec:
+                        return sec
+            except Exception:
+                pass
+        return candidates[0]
+    return candidates[0]
 
 def get_default_bug_host():
     """Reads BUG_HOST from environment."""
@@ -716,7 +757,9 @@ Examples:
   ssh -o "ProxyCommand=python test_proxy.py --stdio" vpnuser@your-domain.com
         """
     )
-    parser.add_argument("--host", default=get_default_host(), help="Target tunnel hostname (default: .env TUNNEL_HOST or live_domain.txt)")
+    parser.add_argument("--host", default=None, help="Target tunnel hostname (default: .env TUNNEL_HOST or live_domain.txt)")
+    parser.add_argument("--server", "--node", type=int, choices=[1, 2], default=None, help="Target specific server node (1=Primary, 2=Secondary from live_domain.txt)")
+    parser.add_argument("--all", action="store_true", help="Test both Server 1 and Server 2 sequentially")
     parser.add_argument("--bug-host", default=get_default_bug_host(), help="Bug Host IP or domain for zero-rating (default: .env BUG_HOST)")
     parser.add_argument("--port", type=int, default=get_default_port(), help="Target port (default: .env SSH_PORT or 80)")
     parser.add_argument("--tls", action="store_true", help="Enable TLS / HTTPS / WSS")
@@ -732,13 +775,37 @@ Examples:
 
     args = parser.parse_args()
 
-    target_host = args.host.strip() if args.host else ""
+    if args.all:
+        candidates = get_domain_candidates()
+        if not candidates:
+            print(f"{CLR_RED}[!] Error: No servers found in live_domain.txt or environment.{CLR_RESET}")
+            sys.exit(1)
+        print(f"\n{CLR_CYAN}======================================================================{CLR_RESET}")
+        print(f"{CLR_BOLD}             DUAL-SERVER HIGH AVAILABILITY HEALTH AUDIT                {CLR_RESET}")
+        print(f"{CLR_CYAN}======================================================================{CLR_RESET}")
+        for idx, srv_host in enumerate(candidates[:2], 1):
+            lbl = "PRIMARY (Server 1)" if idx == 1 else "SECONDARY (Server 2)"
+            print(f"\n{CLR_YELLOW}>>> AUDITING [{lbl}]: {srv_host}{CLR_RESET}")
+            args.host = srv_host
+            try:
+                run_benchmark(args)
+            except Exception as e:
+                print(f"{CLR_RED}[!] Audit failed for {srv_host}: {e}{CLR_RESET}")
+        return
+
+    if args.host:
+        target_host = args.host.strip()
+    elif args.server:
+        target_host = get_default_host(server_idx=args.server)
+    else:
+        target_host = get_default_host(server_idx=1)
+
     if not target_host:
         print(f"{CLR_RED}[!] Error: No target host specified. Set TUNNEL_HOST in .env, live_domain.txt, or pass --host <domain>{CLR_RESET}")
         sys.exit(1)
 
+    args.host = target_host
     connect_host = args.bug_host.strip() if args.bug_host else target_host
-
 
     if args.stdio:
         run_stdio(target_host, connect_host, args.port, args.tls, args.timeout)

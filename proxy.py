@@ -16,6 +16,7 @@ LISTEN_HOST = "0.0.0.0"
 LISTEN_PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 80
 TARGET_HOST = "127.0.0.1"
 TARGET_PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 22
+SERVER_NAME = sys.argv[3] if len(sys.argv) > 3 else "Server 1"
 
 # Buffer size increased to 64KB for maximum throughput and minimum syscall overhead
 BUFFER_SIZE = 65536
@@ -89,6 +90,7 @@ def handle_client(client_sock: socket.socket, client_addr):
             "HTTP/1.1 101 Switching Protocols\r\n"
             "Upgrade: websocket\r\n"
             "Connection: Upgrade\r\n"
+            f"X-Server-Info: [{SERVER_NAME}] Made By Talha \u2764\r\n"
         )
         if sec_key:
             response += f"Sec-WebSocket-Accept: {compute_accept_key(sec_key)}\r\n"

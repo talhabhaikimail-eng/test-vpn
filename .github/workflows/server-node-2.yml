@@ -1,0 +1,265 @@
+name: Server 2 - Secondary Node
+on:
+  schedule:
+    # Runs every 6 hours at 03:00, 09:00, 15:00, 21:00 UTC (Offset by 3 hours from Server 1)
+    - cron: '0 3,9,15,21 * * *'
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: 'Duration to keep tunnel alive in minutes (default: 345 = 5h 45m)'
+        required: false
+        default: '345'
+        type: string
+      tunnel_mode:
+        description: 'Tunnel Mode: quick (free trycloudflare.com) or token (named tunnel)'
+        required: false
+        default: 'quick'
+        type: choice
+        options:
+          - quick
+          - token
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  server-2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # ── Install tools ───────────────────────────────────────────────────────
+      - name: Install Cloudflared
+        run: |
+          curl -sSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          chmod +x cloudflared
+          sudo mv cloudflared /usr/local/bin/cloudflared
+
+      # ── SSH Server ──────────────────────────────────────────────────────────
+      - name: Setup OpenSSH Server
+        env:
+          SSH_PASS: ${{ secrets.SSH_PASSWORD }}
+        run: |
+          if [ -z "$SSH_PASS" ]; then
+            echo "ERROR: SSH_PASSWORD secret is not set."
+            exit 1
+          fi
+
+          sudo apt-get update -qq
+          sudo apt-get install -y openssh-server
+
+          sudo sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#*AllowTcpForwarding.*/AllowTcpForwarding yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#*GatewayPorts.*/GatewayPorts yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#*PermitTunnel.*/PermitTunnel yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#*TCPKeepAlive.*/TCPKeepAlive yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#*ClientAliveInterval.*/ClientAliveInterval 15/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#*ClientAliveCountMax.*/ClientAliveCountMax 10/' /etc/ssh/sshd_config
+
+          sudo mkdir -p /etc/ssh/sshd_config.d
+          printf '%s\n' \
+            'PasswordAuthentication yes' \
+            'AllowTcpForwarding yes' \
+            'GatewayPorts yes' \
+            'PermitTunnel yes' \
+            'TCPKeepAlive yes' \
+            'ClientAliveInterval 15' \
+            'ClientAliveCountMax 10' \
+            'UseDNS no' \
+            'GSSAPIAuthentication no' \
+            'Compression no' \
+            'MaxStartups 100:30:200' \
+            | sudo tee /etc/ssh/sshd_config.d/99-custom.conf > /dev/null
+
+          # All times in Asia/Karachi (PKT = UTC+5)
+          START_TIME=$(TZ='Asia/Karachi' date '+%d %b %Y %H:%M PKT')
+          SHUTDOWN_TIME=$(TZ='Asia/Karachi' date -d '+6 hours' '+%d %b %Y %H:%M PKT')
+
+          sudo python3 write_banners.py "$START_TIME" "$SHUTDOWN_TIME" "Server 2 (Secondary)"
+          echo 'Banner /etc/ssh/banner' | sudo tee -a /etc/ssh/sshd_config.d/99-custom.conf > /dev/null
+
+          sudo systemctl restart ssh || sudo service ssh restart
+
+          SSH_USER="vpnuser"
+          sudo useradd -m -s /bin/bash "$SSH_USER" 2>/dev/null || true
+          echo "$SSH_USER:$SSH_PASS" | sudo chpasswd
+          sudo usermod -aG sudo "$SSH_USER"
+          echo "SSH user created."
+
+      # ── TCP tuning ──────────────────────────────────────────────────────────
+      - name: Tune TCP Stack (BDP Optimized for High-Latency Links)
+        run: |
+          sudo sysctl -w net.core.rmem_max=16777216
+          sudo sysctl -w net.core.wmem_max=16777216
+          sudo sysctl -w net.ipv4.tcp_rmem="4096 2097152 16777216"
+          sudo sysctl -w net.ipv4.tcp_wmem="4096 2097152 16777216"
+          sudo modprobe tcp_bbr 2>/dev/null || true
+          sudo sysctl -w net.ipv4.tcp_congestion_control=bbr || true
+          sudo sysctl -w net.ipv4.tcp_fastopen=3
+          sudo sysctl -w net.ipv4.tcp_notsent_lowat=16384
+          sudo sysctl -w net.core.netdev_max_backlog=5000
+          sudo sysctl -w net.core.somaxconn=4096
+          sudo sysctl -w net.ipv4.tcp_slow_start_after_idle=0
+          echo "BBR: $(cat /proc/sys/net/ipv4/tcp_congestion_control)"
+
+      # ── WebSocket proxy ─────────────────────────────────────────────────────
+      - name: Start WebSocket Bridge (Go Zero-Copy Proxy)
+        run: |
+          sudo fuser -k 80/tcp 2>/dev/null || true
+          if command -v go &>/dev/null && [ -f proxy.go ]; then
+            go build -o proxy_bin proxy.go
+            sudo ./proxy_bin --listen 0.0.0.0:80 --target 127.0.0.1:22 --name "Server 2 (Secondary)" > /dev/null 2>&1 &
+          else
+            chmod +x proxy.py
+            sudo python3 proxy.py 80 22 "Server 2 (Secondary)" > /dev/null 2>&1 &
+          fi
+          sleep 2
+          sudo ss -tulpn | grep ':80' || true
+
+      # ── Cloudflare tunnel ───────────────────────────────────────────────────
+      - name: Start Cloudflare Tunnel
+        run: |
+          MODE="${{ github.event.inputs.tunnel_mode || 'quick' }}"
+          CF_TOKEN_2="${{ secrets.CLOUDFLARE_TUNNEL_TOKEN_2 || secrets.CLOUDFLARE_TUNNEL_TOKEN }}"
+
+          if [ "$MODE" = "token" ] && [ -n "$CF_TOKEN_2" ]; then
+            echo "Starting named Cloudflare tunnel with token..."
+            cloudflared tunnel --protocol quic run --token "$CF_TOKEN_2" > cf_tunnel.log 2>&1 &
+            sleep 8
+            CUSTOM="${{ secrets.CUSTOM_DOMAIN }}"
+            DOMAIN="${CUSTOM:-tunnel.ufone-claim.site}"
+            echo "DOMAIN=$DOMAIN" >> $GITHUB_ENV
+          else
+            echo "Starting Cloudflare quick tunnel (trycloudflare.com)..."
+            cloudflared tunnel --url http://127.0.0.1:80 > cf_tunnel.log 2>&1 &
+            for i in $(seq 1 30); do
+              CF_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' cf_tunnel.log | head -n 1)
+              [ -n "$CF_URL" ] && break
+              sleep 1
+            done
+            if [ -z "$CF_URL" ]; then
+              echo "Failed to obtain trycloudflare URL"; exit 1
+            fi
+            DOMAIN=$(echo "$CF_URL" | sed 's|https://||')
+            echo "DOMAIN=$DOMAIN" >> $GITHUB_ENV
+          fi
+
+          # Update live_domain.txt (Server 1 is on line 1, Server 2 is on line 2)
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull --rebase origin main || true
+
+          PRIMARY_DOM="tunnel.ufone-claim.site"
+          if [ -f live_domain.txt ]; then
+            FIRST_LINE=$(head -n 1 live_domain.txt | tr -d '\r' | xargs)
+            if [ -n "$FIRST_LINE" ]; then
+              PRIMARY_DOM="$FIRST_LINE"
+            fi
+          fi
+
+          printf "%s\n%s\n" "$PRIMARY_DOM" "$DOMAIN" > live_domain.txt
+          echo "$DOMAIN" > live_domain_secondary.txt
+
+          git add live_domain.txt live_domain_secondary.txt
+          git commit -m "chore: update secondary live domain ($DOMAIN) [skip ci]" || true
+          git push origin main || true
+
+      - name: Tunnel Ready
+        run: echo "Server 2 (Secondary) live on ${{ env.DOMAIN }}"
+
+      # ── Concurrency guard: cancel older runs of THIS WORKFLOW only ───────────
+      - name: Cancel Older Runs of Server 2 (Never touches Server 1)
+        run: |
+          THIS_RUN="${{ github.run_id }}"
+          WORKFLOW="server-node-2.yml"
+          echo "Checking older runs of $WORKFLOW..."
+          RUNS=$(gh run list --workflow "$WORKFLOW" -s in_progress -L 30 --json databaseId -q '.[].databaseId' 2>/dev/null || true)
+          for R in $RUNS; do
+            if [ "$R" != "$THIS_RUN" ]; then
+              echo "Cancelling older Server 2 run $R..."
+              gh run cancel "$R" || true
+            fi
+          done
+
+      # ── Mutual Watchdog & Keep-Alive Loop ───────────────────────────────────
+      - name: Keep Alive, Mutual Watchdog & Lifecycle Hand-off
+        run: |
+          PEER_WORKFLOW="server-node-1.yml"
+          THIS_WORKFLOW="server-node-2.yml"
+          TARGET_DURATION=${{ github.event.inputs.duration_minutes || 345 }}
+          TOTAL_SECONDS=$((TARGET_DURATION * 60))
+          INTERVAL=30
+          ELAPSED=0
+          LAST_PEER_TRIGGER=0
+
+          echo "Server 2 running for $TARGET_DURATION minutes ($TOTAL_SECONDS s)."
+          echo "Active Watchdog checking local health every 30s and Peer ($PEER_WORKFLOW) every 3m..."
+
+          # ── Startup Phase Check ──
+          P_ACTIVE=$(gh run list --workflow "$PEER_WORKFLOW" -s in_progress -L 5 --json databaseId -q 'length' 2>/dev/null || echo "1")
+          P_QUEUED=$(gh run list --workflow "$PEER_WORKFLOW" -s queued -L 5 --json databaseId -q 'length' 2>/dev/null || echo "0")
+          P_TOTAL=$((P_ACTIVE + P_QUEUED))
+
+          if [ "$P_TOTAL" -eq 0 ]; then
+            echo "[INIT SYNC] Server 1 is NOT active! Booting Server 1..."
+            gh workflow run "$PEER_WORKFLOW" || true
+            LAST_PEER_TRIGGER=$(date +%s)
+          else
+            echo "[INIT SYNC] Server 1 is already active/queued (count: $P_TOTAL)."
+          fi
+
+          # ── Main Watchdog Loop ──
+          while [ $ELAPSED -lt $TOTAL_SECONDS ]; do
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+
+            # 1. Local Health Check (Auto-heal proxy or cloudflared if killed)
+            if ! pgrep -f "proxy" > /dev/null; then
+              echo "[WATCHDOG] Local proxy process died! Restarting..."
+              if [ -f proxy_bin ]; then
+                sudo ./proxy_bin --listen 0.0.0.0:80 --target 127.0.0.1:22 --name "Server 2 (Secondary)" > /dev/null 2>&1 &
+              else
+                sudo python3 proxy.py 80 22 "Server 2 (Secondary)" > /dev/null 2>&1 &
+              fi
+            fi
+
+            if ! pgrep -f "cloudflared" > /dev/null; then
+              echo "[WATCHDOG] Local cloudflared died! Restarting..."
+              cloudflared tunnel --url http://127.0.0.1:80 > cf_tunnel.log 2>&1 &
+            fi
+
+            # 2. Peer Cross-Check (Every 3 minutes = 180 seconds)
+            if [ $((ELAPSED % 180)) -eq 0 ]; then
+              NOW=$(date +%s)
+              SINCE_TRIGGER=$((NOW - LAST_PEER_TRIGGER))
+              if [ $SINCE_TRIGGER -gt 600 ]; then
+                CHECK_ACT=$(gh run list --workflow "$PEER_WORKFLOW" -s in_progress -L 5 --json databaseId -q 'length' 2>/dev/null || echo "1")
+                CHECK_QUE=$(gh run list --workflow "$PEER_WORKFLOW" -s queued -L 5 --json databaseId -q 'length' 2>/dev/null || echo "0")
+                CHECK_TOT=$((CHECK_ACT + CHECK_QUE))
+                if [ "$CHECK_TOT" -eq 0 ]; then
+                  echo "[WATCHDOG ALERT] Peer Server 1 is DOWN (0 active/queued)! Auto-healing: dispatching Server 1..."
+                  gh workflow run "$PEER_WORKFLOW" || true
+                  LAST_PEER_TRIGGER=$NOW
+                fi
+              fi
+            fi
+          done
+
+          # ── Lifecycle Hand-off (Seamless Self-Restart) ──
+          echo "[LIFECYCLE] Server 2 reached end of shift ($TARGET_DURATION m). Initiating hand-off..."
+          SELF_ACT=$(gh run list --workflow "$THIS_WORKFLOW" -s in_progress -L 5 --json databaseId -q 'length' 2>/dev/null || echo "1")
+          SELF_QUE=$(gh run list --workflow "$THIS_WORKFLOW" -s queued -L 5 --json databaseId -q 'length' 2>/dev/null || echo "0")
+          SELF_TOT=$((SELF_ACT + SELF_QUE))
+
+          if [ "$SELF_TOT" -le 1 ]; then
+            echo "[LIFECYCLE] Dispatching replacement run of Server 2 (345m standard shift)..."
+            gh workflow run "$THIS_WORKFLOW" -f duration_minutes=345 -f tunnel_mode=${{ github.event.inputs.tunnel_mode || 'quick' }} || true
+            echo "Waiting 45 seconds for new runner to take over..."
+            sleep 45
+          fi
+          echo "Server 2 shift ended cleanly."
