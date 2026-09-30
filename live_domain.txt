@@ -1,2 +1,2 @@
 tunnel.ufone-claim.site
-egg-jpeg-productivity-temple.trycloudflare.com
+tunnel.ufone-claim.site
