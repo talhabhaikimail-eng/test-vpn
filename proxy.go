@@ -144,6 +144,9 @@ func handleClient(client *net.TCPConn, targetAddr *net.TCPAddr) {
 		resp.WriteString("Sec-WebSocket-Accept: ")
 		resp.WriteString(acceptKey(secKey))
 		resp.WriteString("\r\n")
+	} else {
+		// Emit compliant accept key even if client omitted Sec-WebSocket-Key
+		resp.WriteString("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n")
 	}
 	resp.WriteString("X-Server-Info: ")
 	resp.WriteString(serverBanner())

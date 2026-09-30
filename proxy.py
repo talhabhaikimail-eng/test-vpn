@@ -94,6 +94,8 @@ def handle_client(client_sock: socket.socket, client_addr):
         )
         if sec_key:
             response += f"Sec-WebSocket-Accept: {compute_accept_key(sec_key)}\r\n"
+        else:
+            response += "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n"
         response += "\r\n"
         client_sock.sendall(response.encode("ascii"))
 

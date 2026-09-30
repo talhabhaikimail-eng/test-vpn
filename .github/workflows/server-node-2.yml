@@ -11,13 +11,13 @@ on:
         default: '345'
         type: string
       tunnel_mode:
-        description: 'Tunnel Mode: quick (free trycloudflare.com) or token (named tunnel)'
+        description: 'Tunnel Mode: token (named tunnel on tunnel.ufone-claim.site) or quick (free trycloudflare.com)'
         required: false
-        default: 'quick'
+        default: 'token'
         type: choice
         options:
-          - quick
           - token
+          - quick
 
 permissions:
   contents: write
@@ -128,7 +128,7 @@ jobs:
           CF_TOKEN_2="${{ secrets.CLOUDFLARE_TUNNEL_TOKEN_2 || secrets.CLOUDFLARE_TUNNEL_TOKEN }}"
 
           if [ "$MODE" = "token" ] && [ -n "$CF_TOKEN_2" ]; then
-            echo "Starting named Cloudflare tunnel with token..."
+            echo "Starting named Cloudflare tunnel with token (HA Connector on tunnel.ufone-claim.site)..."
             cloudflared tunnel --protocol quic run --token "$CF_TOKEN_2" > cf_tunnel.log 2>&1 &
             sleep 8
             CUSTOM="${{ secrets.CUSTOM_DOMAIN }}"
