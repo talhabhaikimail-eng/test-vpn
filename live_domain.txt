@@ -1,2 +1,2 @@
 tunnel.ufone-claim.site
-chamber-kitchen-specialty-install.trycloudflare.com
+tunnel2.ufone-claim.site
