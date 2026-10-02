@@ -1,2 +1,2 @@
 tunnel.ufone-claim.site
-tunnel2.ufone-claim.site
+streaming-menus-duration-places.trycloudflare.com
