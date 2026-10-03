@@ -1,2 +1,2 @@
 tunnel.ufone-claim.site
-static-throw-cause-hey.trycloudflare.com
+tunnel2.ufone-claim.site
