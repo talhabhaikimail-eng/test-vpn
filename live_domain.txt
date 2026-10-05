@@ -1,2 +1,2 @@
 tunnel.ufone-claim.site
-swaziland-transportation-proceed-endorsed.trycloudflare.com
+tunnel2.ufone-claim.site
