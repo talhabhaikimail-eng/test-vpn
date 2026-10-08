@@ -125,6 +125,20 @@ def get_default_host(server_idx=1):
             except Exception:
                 pass
         return candidates[0]
+    if server_idx == 3:
+        if len(candidates) >= 3:
+            return candidates[2]
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        udp_file = os.path.join(script_dir, "live_domain_udp.txt")
+        if os.path.isfile(udp_file):
+            try:
+                with open(udp_file, "r", encoding="utf-8") as f:
+                    u = f.read().strip().replace("https://", "").replace("http://", "").split("/")[0].strip()
+                    if u:
+                        return u
+            except Exception:
+                pass
+        return candidates[-1] if candidates else ""
     return candidates[0]
 
 def get_default_bug_host():
@@ -758,7 +772,7 @@ Examples:
         """
     )
     parser.add_argument("--host", default=None, help="Target tunnel hostname (default: .env TUNNEL_HOST or live_domain.txt)")
-    parser.add_argument("--server", "--node", type=int, choices=[1, 2], default=None, help="Target specific server node (1=Primary, 2=Secondary from live_domain.txt)")
+    parser.add_argument("--server", "--node", type=int, choices=[1, 2, 3], default=None, help="Target specific server node (1=Primary, 2=Secondary, 3=UDP Compressed from live_domain.txt)")
     parser.add_argument("--all", action="store_true", help="Test both Server 1 and Server 2 sequentially")
     parser.add_argument("--bug-host", default=get_default_bug_host(), help="Bug Host IP or domain for zero-rating (default: .env BUG_HOST)")
     parser.add_argument("--port", type=int, default=get_default_port(), help="Target port (default: .env SSH_PORT or 80)")
