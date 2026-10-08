@@ -1,3 +1,2 @@
 tunnel.ufone-claim.site
 tunnel1.ufone-claim.site
-tunnel-udp.ufone-claim.site
