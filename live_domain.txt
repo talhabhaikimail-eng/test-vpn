@@ -1,3 +1,2 @@
 tunnel.ufone-claim.site
-children-accurate-consultancy-receives.trycloudflare.com
-fri-laundry-bands-specifically.trycloudflare.com
+tunnel2.ufone-claim.site
