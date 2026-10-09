@@ -1,3 +1,2 @@
 tunnel.ufone-claim.site
 tunnel2.ufone-claim.site
-portland-navigate-switched-leaf.trycloudflare.com
