@@ -1,3 +1,2 @@
 tunnel.ufone-claim.site
 tunnel2.ufone-claim.site
-evaluated-chapters-combining-finals.trycloudflare.com
