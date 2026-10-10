@@ -1,3 +1,2 @@
 tunnel.ufone-claim.site
-tunnel2.ufone-claim.site
-tunnel-udp.ufone-claim.site
+unix-holders-household-machinery.trycloudflare.com
