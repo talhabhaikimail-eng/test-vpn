@@ -1,2 +1,3 @@
 tunnel.ufone-claim.site
 objective-unlimited-dish-lived.trycloudflare.com
+tunnel-udp.ufone-claim.site
