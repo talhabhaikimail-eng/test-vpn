@@ -1,3 +1,2 @@
 tunnel.ufone-claim.site
 tunnel2.ufone-claim.site
-arms-projectors-lambda-children.trycloudflare.com
