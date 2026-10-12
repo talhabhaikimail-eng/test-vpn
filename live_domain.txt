@@ -1,2 +1,3 @@
 tunnel.ufone-claim.site
 namespace-deposits-concept-blocking.trycloudflare.com
+tunnel-udp.ufone-claim.site
