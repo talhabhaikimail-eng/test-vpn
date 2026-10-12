@@ -1,3 +1,2 @@
 tunnel.ufone-claim.site
 tunnel2.ufone-claim.site
-cope-communication-deliver-planners.trycloudflare.com
