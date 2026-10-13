@@ -49,7 +49,7 @@ python test_proxy.py -n 20 -c 5
 
 ## Client Configuration (NetMod / Download Engine / OpenTunnel)
 
-- **Bug Host**: `jsbl.com` (or your carrier zero-rated host)
+- **Bug Host**:  (or your carrier zero-rated host)
 - **Bug Port**: `80`
 - **Use TLS**: `false` (for port 80) or `true` (for port 443 with SNI)
 - **SSH Host**: `<domain-from-live_domain.txt>`
