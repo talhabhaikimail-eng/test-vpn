@@ -15,9 +15,20 @@ def get_uuid():
         return sys.argv[1].strip()
     if os.environ.get("V2RAY_UUID"):
         return os.environ.get("V2RAY_UUID").strip()
+    if os.path.exists(".v2ray_uuid"):
+        try:
+            with open(".v2ray_uuid") as f:
+                val = f.read().strip()
+                if val: return val
+        except Exception:
+            pass
     if os.path.exists("/etc/v2ray/uuid.txt"):
-        with open("/etc/v2ray/uuid.txt") as f:
-            return f.read().strip()
+        try:
+            with open("/etc/v2ray/uuid.txt") as f:
+                val = f.read().strip()
+                if val: return val
+        except Exception:
+            pass
     return ""
 
 def get_domain():

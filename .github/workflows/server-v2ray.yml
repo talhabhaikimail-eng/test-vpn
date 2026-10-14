@@ -119,6 +119,8 @@ jobs:
 
       # ── Generate Client Import Links ────────────────────────────────────────
       - name: Generate V2Ray Client Share Links
+        env:
+          V2RAY_UUID: ${{ secrets.V2RAY_UUID }}
         run: |
           python3 generate_v2ray_links.py "" "$DOMAIN"
 

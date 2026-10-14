@@ -43,7 +43,8 @@ fi
 
 sudo mkdir -p /etc/v2ray
 echo "$UUID" | sudo tee /etc/v2ray/uuid.txt > /dev/null
-sudo chmod 600 /etc/v2ray/uuid.txt
+sudo chmod 644 /etc/v2ray/uuid.txt
+echo "$UUID" > .v2ray_uuid
 
 # 4. Generate /etc/v2ray/config.json
 sudo tee /etc/v2ray/config.json > /dev/null <<EOF
