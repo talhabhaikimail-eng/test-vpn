@@ -27,6 +27,11 @@ CLR_BLUE    = "\033[94m"
 CLR_CYAN    = "\033[96m"
 CLR_WHITE   = "\033[97m"
 
+if sys.platform == "win32":
+    os.system("")
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 def load_defaults():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     domain = os.environ.get("V2RAY_DOMAIN") or os.environ.get("CUSTOM_DOMAIN_V2RAY") or "v2ray.ufone-claim.site"
@@ -273,30 +278,30 @@ def print_summary(results):
         tot_std = statistics.stdev(tot_times) if len(tot_times) > 1 else 0.0
 
         print(f"\n {CLR_BOLD}Layer Performance Breakdown (Medians & Jitter):{CLR_RESET}")
-        print(f"   • {CLR_CYAN}Edge TCP Ping{CLR_RESET}     : {CLR_BOLD}{tcp_med:.1f} ms{CLR_RESET} (avg: {tcp_avg:.1f} ms, jitter/σ: {tcp_std:.1f} ms)")
+        print(f"   * {CLR_CYAN}Edge TCP Ping{CLR_RESET}     : {CLR_BOLD}{tcp_med:.1f} ms{CLR_RESET} (avg: {tcp_avg:.1f} ms, jitter: {tcp_std:.1f} ms)")
         if tls_times:
             tls_avg = statistics.mean(tls_times)
             tls_med = statistics.median(tls_times)
-            print(f"   • {CLR_CYAN}TLS Handshake{CLR_RESET}     : {CLR_BOLD}{tls_med:.1f} ms{CLR_RESET} (avg: {tls_avg:.1f} ms)")
-        print(f"   • {CLR_CYAN}WS 101 Handshake{CLR_RESET}  : {CLR_BOLD}{ws_med:.1f} ms{CLR_RESET} (avg: {ws_avg:.1f} ms, jitter/σ: {ws_std:.1f} ms)")
-        print(f"   • {CLR_CYAN}Total E2E Latency{CLR_RESET} : {CLR_BOLD}{tot_avg:.1f} ms{CLR_RESET} (min: {tot_min:.1f} ms, max: {tot_max:.1f} ms, σ: {tot_std:.1f} ms)")
+            print(f"   * {CLR_CYAN}TLS Handshake{CLR_RESET}     : {CLR_BOLD}{tls_med:.1f} ms{CLR_RESET} (avg: {tls_avg:.1f} ms)")
+        print(f"   * {CLR_CYAN}WS 101 Handshake{CLR_RESET}  : {CLR_BOLD}{ws_med:.1f} ms{CLR_RESET} (avg: {ws_avg:.1f} ms, jitter: {ws_std:.1f} ms)")
+        print(f"   * {CLR_CYAN}Total E2E Latency{CLR_RESET} : {CLR_BOLD}{tot_avg:.1f} ms{CLR_RESET} (min: {tot_min:.1f} ms, max: {tot_max:.1f} ms, jitter: {tot_std:.1f} ms)")
 
         # Stability rating
-        if loss_pct == 0 and tot_std < 40:
-            rating = f"{CLR_GREEN}★ ★ ★ ★ ★ EXCELLENT (Rock Solid, Zero Loss, Ultra-low Jitter){CLR_RESET}"
+        if loss_pct == 0 and tot_std < 60:
+            rating = f"{CLR_GREEN}[EXCELLENT] Rock Solid, Zero Loss, Low Jitter{CLR_RESET}"
         elif loss_pct == 0:
-            rating = f"{CLR_GREEN}★ ★ ★ ★ ☆ STABLE (Zero Loss, Normal Jitter){CLR_RESET}"
+            rating = f"{CLR_GREEN}[STABLE] Zero Loss, Normal Jitter{CLR_RESET}"
         elif loss_pct < 10:
-            rating = f"{CLR_YELLOW}★ ★ ★ ☆ ☆ ACCEPTABLE (Minor Loss < 10%){CLR_RESET}"
+            rating = f"{CLR_YELLOW}[ACCEPTABLE] Minor Loss < 10%{CLR_RESET}"
         else:
-            rating = f"{CLR_RED}★ ☆ ☆ ☆ ☆ DEGRADED (Loss >= 10%){CLR_RESET}"
+            rating = f"{CLR_RED}[DEGRADED] Loss >= 10%{CLR_RESET}"
         print(f"\n {CLR_BOLD}Stability Rating{CLR_RESET}  : {rating}")
     else:
         print(f"\n {CLR_RED}All probes failed! Common causes:{CLR_RESET}")
         sample_err = failures[0]["error"] if failures else "Unknown"
-        print(f"   • Last Error: {CLR_YELLOW}{sample_err}{CLR_RESET}")
+        print(f"   * Last Error: {CLR_YELLOW}{sample_err}{CLR_RESET}")
         if "1016" in str(sample_err):
-            print(f"   • {CLR_BOLD}Cloudflare Error 1016{CLR_RESET}: The hostname is not yet configured under Cloudflare Zero Trust 'Public Hostnames'.")
+            print(f"   * {CLR_BOLD}Cloudflare Error 1016{CLR_RESET}: The hostname is not yet configured under Cloudflare Zero Trust 'Public Hostnames'.")
             print(f"     Add: Subdomain='v2ray', Domain='ufone-claim.site', Type='HTTP', URL='localhost:8080'")
 
     print(f"{CLR_BOLD}{CLR_CYAN}======================================================================{CLR_RESET}\n")

@@ -121,8 +121,17 @@ func handleClient(client *net.TCPConn, vlessAddr, vmessAddr *net.TCPAddr) {
 	defer upstream.Close()
 	tune(upstream)
 
-	// Send initial HTTP request bytes directly to V2Ray Core
-	if _, err := upstream.Write(headerBuf[:n]); err != nil {
+	// Send initial HTTP request bytes with normalized path to V2Ray Core
+	var forwardBuf bytes.Buffer
+	forwardBuf.Grow(n + 32)
+	if crlf := bytes.Index(headerBuf[:n], []byte("\r\n")); crlf != -1 {
+		forwardBuf.WriteString("GET / HTTP/1.1\r\n")
+		forwardBuf.Write(headerBuf[crlf+2 : n])
+	} else {
+		forwardBuf.Write(headerBuf[:n])
+	}
+
+	if _, err := upstream.Write(forwardBuf.Bytes()); err != nil {
 		return
 	}
 
