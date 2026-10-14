@@ -1,0 +1,37 @@
+# Render Blueprint — V2Ray node in Singapore (lower RTT from Pakistan than the US GitHub runners).
+# Deploy: Render Dashboard -> New -> Blueprint -> pick this repo. You'll be prompted for V2RAY_UUID.
+services:
+  - type: web
+    name: v2ray-sg
+    runtime: docker
+    region: singapore
+    # starter: always on, 0.5 CPU / 512 MB. Bump to standard (1 CPU / 2 GB) if many users share it.
+    plan: starter
+    dockerfilePath: ./render/Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeploy: true
+    buildFilter:
+      paths:
+        - render/**
+        - render.yaml
+        - proxy_v2ray.go
+        - quickack_linux.go
+        - .dockerignore
+    domains:
+      - v2ray-sg.ufone-claim.site
+    envVars:
+      - key: V2RAY_UUID
+        sync: false
+      - key: NODE_NAME
+        value: V2Ray SG (Render)
+      # Web panel at https://<host>/ (config links + speed test). Login: admin / UI_PASSWORD
+      # (Render generates it; see Environment tab). Delete UI_PASSWORD to disable the panel.
+      - key: UI_PASSWORD
+        generateValue: true
+      - key: UI_USER
+        value: admin
+      - key: BUG_HOST
+        value: jsbl.com
+      - key: PUBLIC_HOST
+        value: v2ray-sg.ufone-claim.site

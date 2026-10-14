@@ -56,7 +56,19 @@ func forward(dst, src *net.TCPConn, done chan<- struct{}) {
 	_, _ = io.Copy(dst, src)
 }
 
-func handleClient(client *net.TCPConn, vlessAddr, vmessAddr *net.TCPAddr) {
+// isWebSocketUpgrade reports whether the request headers carry "Upgrade: websocket".
+func isWebSocketUpgrade(headerData []byte) bool {
+	for _, line := range bytes.Split(headerData, []byte("\r\n")) {
+		k, v, ok := bytes.Cut(line, []byte(":"))
+		if ok && bytes.EqualFold(bytes.TrimSpace(k), []byte("upgrade")) &&
+			bytes.Contains(bytes.ToLower(v), []byte("websocket")) {
+			return true
+		}
+	}
+	return false
+}
+
+func handleClient(client *net.TCPConn, vlessAddr, vmessAddr, httpAddr *net.TCPAddr) {
 	defer client.Close()
 	tune(client)
 
@@ -105,9 +117,13 @@ func handleClient(client *net.TCPConn, vlessAddr, vmessAddr *net.TCPAddr) {
 		return
 	}
 
-	// 2. Route path to upstream V2Ray inbound
+	// 2. Route: plain HTTP -> web UI (if enabled), WebSocket -> V2Ray inbound by path
+	isWS := isWebSocketUpgrade(headerData)
 	targetAddr := vlessAddr
-	if bytes.HasPrefix(path, []byte("/vmess")) && vmessAddr != nil {
+	switch {
+	case !isWS && httpAddr != nil:
+		targetAddr = httpAddr
+	case bytes.HasPrefix(path, []byte("/vmess")) && vmessAddr != nil:
 		targetAddr = vmessAddr
 	}
 
@@ -121,10 +137,10 @@ func handleClient(client *net.TCPConn, vlessAddr, vmessAddr *net.TCPAddr) {
 	defer upstream.Close()
 	tune(upstream)
 
-	// Send initial HTTP request bytes with normalized path to V2Ray Core
+	// Send initial HTTP request bytes; WebSocket requests get the path normalized for V2Ray Core
 	var forwardBuf bytes.Buffer
 	forwardBuf.Grow(n + 32)
-	if crlf := bytes.Index(headerBuf[:n], []byte("\r\n")); crlf != -1 {
+	if crlf := bytes.Index(headerBuf[:n], []byte("\r\n")); crlf != -1 && isWS {
 		forwardBuf.WriteString("GET / HTTP/1.1\r\n")
 		forwardBuf.Write(headerBuf[crlf+2 : n])
 	} else {
@@ -147,6 +163,7 @@ func main() {
 	listen    := flag.String("listen",    "0.0.0.0:8080",   "listen address for Cloudflare Tunnel reverse proxy")
 	vless     := flag.String("vless",     "127.0.0.1:10085", "upstream V2Ray VLESS WS address")
 	vmess     := flag.String("vmess",     "127.0.0.1:10086", "upstream V2Ray VMess WS address")
+	httpUp    := flag.String("http",      "",                "optional upstream for non-WebSocket requests (web UI)")
 	maxConns  := flag.Int("max-conns",    2048,              "max concurrent connections")
 	name      := flag.String("name",      "V2Ray Node 1",    "server instance name")
 	flag.Parse()
@@ -170,6 +187,14 @@ func main() {
 		vmessAddr, err = net.ResolveTCPAddr("tcp", *vmess)
 		if err != nil {
 			log.Fatalf("resolve vmess %s: %v", *vmess, err)
+		}
+	}
+
+	var httpAddr *net.TCPAddr
+	if *httpUp != "" {
+		httpAddr, err = net.ResolveTCPAddr("tcp", *httpUp)
+		if err != nil {
+			log.Fatalf("resolve http %s: %v", *httpUp, err)
 		}
 	}
 
@@ -215,7 +240,7 @@ func main() {
 		go func(c *net.TCPConn) {
 			defer active.Done()
 			defer func() { <-sem }()
-			handleClient(c, vlessAddr, vmessAddr)
+			handleClient(c, vlessAddr, vmessAddr, httpAddr)
 		}(conn)
 	}
 

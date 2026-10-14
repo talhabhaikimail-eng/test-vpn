@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>V2Ray Panel</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js"></script>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #ffffff; --text: #16181d; --muted: #646b78; --line: #e3e6eb;
+    --accent: #2f6fed; --accent-text: #ffffff; --good: #138a4a; --code: #f1f3f6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1115; --card: #171a21; --text: #e8eaee; --muted: #9aa2b1; --line: #262b35;
+      --accent: #5b8cff; --accent-text: #0b0d12; --good: #3ccf7f; --code: #10131a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 860px; margin: 0 auto; padding: 24px 16px 48px; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 20px; }
+  h1 { font-size: 22px; margin: 0; }
+  h2 { font-size: 16px; margin: 0 0 12px; }
+  .muted { color: var(--muted); font-size: 13px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+  .row { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; }
+  label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); }
+  input[type=text] { min-width: 0; width: 220px; max-width: 100%; padding: 8px 10px; border-radius: 8px;
+                     border: 1px solid var(--line); background: var(--code); color: var(--text); font: inherit; }
+  .check { flex-direction: row; align-items: center; gap: 6px; color: var(--text); }
+  button { padding: 8px 14px; border-radius: 8px; border: 1px solid var(--line); background: var(--code);
+           color: var(--text); font: inherit; cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); font-weight: 600; }
+  button:disabled { opacity: .6; cursor: default; }
+  .link { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); }
+  .link:first-of-type { border-top: 0; padding-top: 0; margin-top: 0; }
+  .link-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+  .link-head strong { font-size: 14px; }
+  .btns { display: flex; gap: 6px; }
+  code.uri { display: block; padding: 10px; border-radius: 8px; background: var(--code); border: 1px solid var(--line);
+             font: 12px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace; word-break: break-all; user-select: all; }
+  .qr { margin-top: 10px; display: none; background: #fff; padding: 10px; border-radius: 8px; width: fit-content; }
+  .qr.show { display: block; }
+  .qr img { display: block; width: 220px; height: 220px; image-rendering: pixelated; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  td { padding: 6px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+  td:first-child { color: var(--muted); width: 38%; padding-right: 12px; }
+  td code { font: 13px ui-monospace, SFMono-Regular, Consolas, monospace; word-break: break-all; }
+  .stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 14px 0 10px; }
+  .stat { background: var(--code); border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
+  .stat .v { font-size: 26px; font-weight: 650; font-variant-numeric: tabular-nums; }
+  .stat .u { font-size: 12px; color: var(--muted); }
+  .bar { height: 4px; background: var(--line); border-radius: 2px; overflow: hidden; }
+  .bar > div { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+  .toast { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); background: var(--text); color: var(--bg);
+           padding: 8px 14px; border-radius: 8px; font-size: 13px; opacity: 0; transition: opacity .2s; pointer-events: none; }
+  .toast.show { opacity: 1; }
+  @media (max-width: 600px) { .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1 id="node">V2Ray Panel</h1>
+    <span class="muted" id="host"></span>
+  </header>
+
+  <section class="card">
+    <h2>Client settings</h2>
+    <div class="row">
+      <label>Bug host (address)
+        <input type="text" id="bug" spellcheck="false" autocomplete="off">
+      </label>
+      <label>Server host (SNI / Host)
+        <input type="text" id="sni" spellcheck="false" autocomplete="off">
+      </label>
+      <label class="check"><input type="checkbox" id="ed" checked> Early data (?ed=2048, faster connects)</label>
+    </div>
+  </section>
+
+  <section class="card" id="links"></section>
+
+  <section class="card">
+    <h2>Manual setup</h2>
+    <table id="fields"></table>
+  </section>
+
+  <section class="card">
+    <div class="row" style="justify-content: space-between; align-items: center;">
+      <div>
+        <h2 style="margin: 0;">Speed test</h2>
+        <div class="muted">Your browser ↔ this server, directly (turn your VPN off for a real reading).</div>
+      </div>
+      <button class="primary" id="go">Start</button>
+    </div>
+    <div class="stats">
+      <div class="stat"><div class="u">Ping</div><div class="v" id="ping">–</div><div class="u">ms</div></div>
+      <div class="stat"><div class="u">Jitter</div><div class="v" id="jit">–</div><div class="u">ms</div></div>
+      <div class="stat"><div class="u">Download</div><div class="v" id="down">–</div><div class="u">Mbps</div></div>
+      <div class="stat"><div class="u">Upload</div><div class="v" id="up">–</div><div class="u">Mbps</div></div>
+    </div>
+    <div class="bar"><div id="prog"></div></div>
+    <div class="muted" id="phase" style="margin-top: 8px;">Uses ~50–150 MB of bandwidth.</div>
+  </section>
+</main>
+<div class="toast" id="toast">Copied</div>
+
+<script>
+const CFG = __PANEL_CONFIG__;
+const $ = (id) => document.getElementById(id);
+
+$("node").textContent = CFG.nodeName;
+$("host").textContent = CFG.host;
+$("bug").value = localGet("bug") ?? CFG.bugHost;
+$("sni").value = CFG.host;
+$("ed").checked = localGet("ed") !== "0";
+
+function localGet(k) { try { return localStorage.getItem("v2p." + k); } catch { return null; } }
+function localSet(k, v) { try { localStorage.setItem("v2p." + k, v); } catch {} }
+
+function b64utf8(s) { return btoa(String.fromCharCode(...new TextEncoder().encode(s))); }
+
+function vless(addr, host, path, name) {
+  const q = new URLSearchParams({ encryption: "none", security: "tls", sni: host, type: "ws", host, path });
+  return `vless://${CFG.uuid}@${addr}:443?${q}#${encodeURIComponent(name)}`;
+}
+function vmess(addr, host, path, name) {
+  return "vmess://" + b64utf8(JSON.stringify({
+    v: "2", ps: name, add: addr, port: "443", id: CFG.uuid, aid: "0", scy: "auto",
+    net: "ws", type: "none", host, path, tls: "tls", sni: host, alpn: ""
+  }));
+}
+
+function render() {
+  const bug = $("bug").value.trim();
+  const host = $("sni").value.trim() || CFG.host;
+  const ed = $("ed").checked ? "?ed=2048" : "";
+  localSet("bug", bug); localSet("ed", $("ed").checked ? "1" : "0");
+
+  const items = [];
+  if (bug) {
+    items.push(["VLESS · via bug host " + bug, vless(bug, host, "/vless" + ed, `VLESS-${bug}`)]);
+    items.push(["VMess · via bug host " + bug, vmess(bug, host, "/vmess" + ed, `VMess-${bug}`)]);
+  }
+  items.push(["VLESS · direct", vless(host, host, "/vless" + ed, `VLESS-${host}`)]);
+  items.push(["VMess · direct", vmess(host, host, "/vmess" + ed, `VMess-${host}`)]);
+
+  const box = $("links");
+  box.innerHTML = "<h2>Import links</h2>";
+  items.forEach(([title, uri], i) => {
+    const el = document.createElement("div");
+    el.className = "link";
+    el.innerHTML = `<div class="link-head"><strong></strong><div class="btns">
+        <button data-copy="${i}">Copy</button><button data-qr="${i}">QR</button></div></div>
+      <code class="uri"></code><div class="qr" id="qr${i}"></div>`;
+    el.querySelector("strong").textContent = title;
+    el.querySelector("code").textContent = uri;
+    el.querySelector("[data-copy]").onclick = () => copy(uri);
+    el.querySelector("[data-qr]").onclick = () => toggleQR(`qr${i}`, uri);
+    box.appendChild(el);
+  });
+
+  const rows = [
+    ["Address", bug || host], ["Port", "443"], ["UUID", CFG.uuid],
+    ["Transport", "WebSocket (ws)"], ["TLS", "on"], ["SNI", host], ["Host header", host],
+    ["Path (VLESS)", "/vless" + ed], ["Path (VMess)", "/vmess" + ed],
+    ["VLESS encryption", "none"], ["VMess alterId / security", "0 / auto"],
+  ];
+  $("fields").innerHTML = "";
+  rows.forEach(([k, v]) => {
+    const tr = $("fields").insertRow();
+    tr.insertCell().textContent = k;
+    const c = tr.insertCell().appendChild(document.createElement("code"));
+    c.textContent = v;
+  });
+}
+
+function toggleQR(id, uri) {
+  const el = $(id);
+  if (!el.classList.contains("show") && typeof qrcode === "function") {
+    const qr = qrcode(0, "M"); qr.addData(uri); qr.make();
+    el.innerHTML = qr.createImgTag(5, 0);
+  } else if (typeof qrcode !== "function") {
+    el.textContent = "QR library failed to load";
+  }
+  el.classList.toggle("show");
+}
+
+async function copy(text) {
+  try { await navigator.clipboard.writeText(text); }
+  catch {
+    const t = document.createElement("textarea"); t.value = text; document.body.appendChild(t);
+    t.select(); document.execCommand("copy"); t.remove();
+  }
+  const toast = $("toast"); toast.classList.add("show");
+  setTimeout(() => toast.classList.remove("show"), 1200);
+}
+
+["bug", "sni"].forEach((id) => $(id).addEventListener("input", render));
+$("ed").addEventListener("change", render);
+render();
+
+// ── Speed test ──────────────────────────────────────────────────────────────
+const fmt = (n) => n >= 100 ? n.toFixed(0) : n.toFixed(1);
+const setProg = (p) => { $("prog").style.width = Math.min(100, p * 100) + "%"; };
+
+async function measurePing() {
+  const samples = [];
+  for (let i = 0; i < 12; i++) {
+    const t0 = performance.now();
+    await fetch("/speedtest/ping?r=" + Math.random(), { cache: "no-store" });
+    samples.push(performance.now() - t0);
+    setProg((i + 1) / 12 * 0.15);
+  }
+  const s = samples.slice(1).sort((a, b) => a - b);
+  const median = s[Math.floor(s.length / 2)];
+  const seq = samples.slice(1);
+  let j = 0; for (let i = 1; i < seq.length; i++) j += Math.abs(seq[i] - seq[i - 1]);
+  $("ping").textContent = median.toFixed(0);
+  $("jit").textContent = (j / (seq.length - 1)).toFixed(0);
+}
+
+async function measureDown(seconds = 8, streams = 4) {
+  const ctrl = new AbortController();
+  let bytes = 0; const t0 = performance.now();
+  const timer = setInterval(() => {
+    const el = (performance.now() - t0) / 1000;
+    $("down").textContent = fmt(bytes * 8 / el / 1e6); setProg(0.15 + Math.min(el / seconds, 1) * 0.425);
+  }, 200);
+  setTimeout(() => ctrl.abort(), seconds * 1000);
+  const worker = async () => {
+    while (!ctrl.signal.aborted) {
+      try {
+        const r = await fetch("/speedtest/down?bytes=" + (25 << 20) + "&r=" + Math.random(), { cache: "no-store", signal: ctrl.signal });
+        const reader = r.body.getReader();
+        for (;;) { const { done, value } = await reader.read(); if (done) break; bytes += value.length; }
+      } catch { break; }
+    }
+  };
+  await Promise.all(Array.from({ length: streams }, worker));
+  clearInterval(timer);
+  $("down").textContent = fmt(bytes * 8 / ((performance.now() - t0) / 1000) / 1e6);
+}
+
+async function measureUp(seconds = 8, streams = 3) {
+  const blob = new Uint8Array(4 << 20);
+  for (let i = 0; i < blob.length; i += 65536) crypto.getRandomValues(blob.subarray(i, i + 65536));
+  let bytes = 0; const t0 = performance.now(); const deadline = t0 + seconds * 1000;
+  const timer = setInterval(() => {
+    const el = (performance.now() - t0) / 1000;
+    $("up").textContent = fmt(bytes * 8 / el / 1e6); setProg(0.575 + Math.min(el / seconds, 1) * 0.425);
+  }, 200);
+  const worker = async () => {
+    while (performance.now() < deadline) {
+      try {
+        const r = await fetch("/speedtest/up?r=" + Math.random(), { method: "POST", body: blob, cache: "no-store" });
+        const j = await r.json(); bytes += j.bytes;
+      } catch { break; }
+    }
+  };
+  await Promise.all(Array.from({ length: streams }, worker));
+  clearInterval(timer);
+  $("up").textContent = fmt(bytes * 8 / ((performance.now() - t0) / 1000) / 1e6);
+}
+
+$("go").onclick = async () => {
+  const btn = $("go"); btn.disabled = true;
+  ["ping", "jit", "down", "up"].forEach((id) => $(id).textContent = "–");
+  try {
+    $("phase").textContent = "Measuring ping…"; await measurePing();
+    $("phase").textContent = "Measuring download…"; await measureDown();
+    $("phase").textContent = "Measuring upload…"; await measureUp();
+    $("phase").textContent = "Done · " + new Date().toLocaleTimeString();
+  } catch (e) {
+    $("phase").textContent = "Speed test failed: " + e.message;
+  }
+  setProg(1); btn.disabled = false;
+};
+</script>
+</body>
+</html>
