@@ -170,6 +170,12 @@ func isWebSocketUpgrade(r *http.Request) bool {
 
 func (rt *router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p := r.URL.Path
+	ws := isWebSocketUpgrade(r)
+	// A non-101 answer to an Upgrade request must close the socket: cloudflared
+	// treats the WS request as a stream and otherwise waits for EOF (hangs).
+	if ws {
+		w.Header().Set("Connection", "close")
+	}
 	switch {
 	case p == "/health" || p == "/ping":
 		banner := serverBanner()
@@ -177,7 +183,7 @@ func (rt *router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Server-Info", banner)
 		w.Header().Set("Cache-Control", "no-store")
 		_, _ = fmt.Fprintf(w, "OK - %s\n", banner)
-	case isWebSocketUpgrade(r):
+	case ws:
 		rt.serveWebSocket(w, r)
 	case rt.xhttp != nil && (p == rt.xhttpPrefix || strings.HasPrefix(p, rt.xhttpPrefix+"/")):
 		rt.xhttp.ServeHTTP(w, r)
