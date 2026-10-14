@@ -31,9 +31,9 @@ on:
           - token
           - quick
       cf_protocol:
-        description: 'cloudflared transport: auto (QUIC, falls back to HTTP/2), quic, or http2'
+        description: 'cloudflared transport: http2 (stable WebSockets from PK edges), quic, or auto'
         required: false
-        default: 'auto'
+        default: 'http2'
         type: choice
         options:
           - auto
@@ -76,7 +76,7 @@ jobs:
       GH_TOKEN: ${{ secrets.PAT_TOKEN }}
       CF_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN_V2RAY || secrets.CLOUDFLARE_TUNNEL_TOKEN }}
       CF_MODE: ${{ github.event.inputs.tunnel_mode || 'token' }}
-      CF_PROTOCOL: ${{ github.event.inputs.cf_protocol || 'auto' }}
+      CF_PROTOCOL: ${{ github.event.inputs.cf_protocol || 'http2' }}
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -89,7 +89,7 @@ jobs:
           sudo mv cloudflared /usr/local/bin/cloudflared
 
           # Shared helpers for the tunnel and watchdog steps.
-          # --protocol auto = QUIC first, falls back to HTTP/2 if UDP is degraded.
+          # Default transport is http2: over QUIC, WS upgrades via the ISB edge intermittently hung.
           # --metrics exposes /ready (200 only while >=1 edge connection is registered).
           cat > "$RUNNER_TEMP/cf.sh" <<'EOF'
           start_cf() {
