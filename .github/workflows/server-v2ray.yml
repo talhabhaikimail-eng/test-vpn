@@ -1,0 +1,194 @@
+name: Server V2Ray - Core Node
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - 'live_domain*.txt'
+      - 'README.md'
+      - '.ai/**'
+  schedule:
+    # Runs every 6 hours at 01:00, 07:00, 13:00, 19:00 UTC
+    - cron: '0 1,7,13,19 * * *'
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: 'Duration to keep tunnel alive in minutes (default: 345 = 5h 45m)'
+        required: false
+        default: '345'
+        type: string
+      custom_domain:
+        description: 'Cloudflare Public Hostname for V2Ray (e.g. v2ray.ufone-claim.site)'
+        required: false
+        default: ''
+        type: string
+      tunnel_mode:
+        description: 'Tunnel Mode: token (Named Tunnel) or quick (trycloudflare.com)'
+        required: false
+        default: 'token'
+        type: choice
+        options:
+          - token
+          - quick
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  server-v2ray:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # ── Install Cloudflared ─────────────────────────────────────────────────
+      - name: Install Cloudflared
+        run: |
+          curl -sSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          chmod +x cloudflared
+          sudo mv cloudflared /usr/local/bin/cloudflared
+
+      # ── TCP tuning ──────────────────────────────────────────────────────────
+      - name: Tune TCP Stack (BDP Optimized for High-Latency Links)
+        run: |
+          sudo sysctl -w net.core.rmem_max=16777216
+          sudo sysctl -w net.core.wmem_max=16777216
+          sudo sysctl -w net.ipv4.tcp_rmem="4096 2097152 16777216"
+          sudo sysctl -w net.ipv4.tcp_wmem="4096 2097152 16777216"
+          sudo modprobe tcp_bbr 2>/dev/null || true
+          sudo sysctl -w net.ipv4.tcp_congestion_control=bbr || true
+          sudo sysctl -w net.ipv4.tcp_fastopen=3
+          sudo sysctl -w net.ipv4.tcp_notsent_lowat=16384
+          sudo sysctl -w net.core.netdev_max_backlog=5000
+          sudo sysctl -w net.core.somaxconn=4096
+          sudo sysctl -w net.ipv4.tcp_slow_start_after_idle=0
+          echo "BBR: $(cat /proc/sys/net/ipv4/tcp_congestion_control)"
+
+      # ── V2Ray Core Setup ────────────────────────────────────────────────────
+      - name: Setup & Start V2Ray Core (VLESS + VMess over WS)
+        env:
+          V2RAY_UUID: ${{ secrets.V2RAY_UUID }}
+        run: |
+          chmod +x setup_v2ray.sh
+          sudo -E ./setup_v2ray.sh "V2Ray Node"
+
+      # ── Cloudflare Tunnel ───────────────────────────────────────────────────
+      - name: Start Cloudflare Tunnel
+        run: |
+          MODE="${{ github.event.inputs.tunnel_mode || 'token' }}"
+          CF_TOKEN="${{ secrets.CLOUDFLARE_TUNNEL_TOKEN_V2RAY || secrets.CLOUDFLARE_TUNNEL_TOKEN }}"
+
+          if [ "$MODE" = "token" ] && [ -n "$CF_TOKEN" ]; then
+            echo "Starting named Cloudflare tunnel with token..."
+            cloudflared tunnel --protocol quic run --token "$CF_TOKEN" > cf_tunnel.log 2>&1 &
+            sleep 8
+            CUSTOM="${{ github.event.inputs.custom_domain || secrets.CUSTOM_DOMAIN_V2RAY }}"
+            if [ -z "$CUSTOM" ] && [ -f live_domain_v2ray.txt ]; then
+              CUSTOM=$(cat live_domain_v2ray.txt | tr -d '\r' | xargs)
+            fi
+            DOMAIN="${CUSTOM:-v2ray.ufone-claim.site}"
+            echo "DOMAIN=$DOMAIN" >> $GITHUB_ENV
+          else
+            echo "Starting Cloudflare quick tunnel (trycloudflare.com) on port 8080..."
+            cloudflared tunnel --url http://127.0.0.1:8080 > cf_tunnel.log 2>&1 &
+            for i in $(seq 1 30); do
+              CF_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' cf_tunnel.log | head -n 1)
+              [ -n "$CF_URL" ] && break
+              sleep 1
+            done
+            if [ -z "$CF_URL" ]; then
+              echo "Failed to obtain trycloudflare URL"; exit 1
+            fi
+            DOMAIN=$(echo "$CF_URL" | sed 's|https://||')
+            echo "DOMAIN=$DOMAIN" >> $GITHUB_ENV
+          fi
+
+          # Update live_domain_v2ray.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull --rebase origin main || true
+
+          echo "$DOMAIN" > live_domain_v2ray.txt
+          git add live_domain_v2ray.txt
+          git commit -m "chore: update live v2ray domain ($DOMAIN) [skip ci]" || true
+          git push origin main || true
+
+      # ── Generate Client Import Links ────────────────────────────────────────
+      - name: Generate V2Ray Client Share Links
+        run: |
+          python3 generate_v2ray_links.py "" "$DOMAIN"
+
+      - name: Tunnel Ready
+        run: echo "V2Ray Node live on ${{ env.DOMAIN }}"
+
+      # ── Concurrency Guard ───────────────────────────────────────────────────
+      - name: Cancel Older Runs of V2Ray Workflow
+        run: |
+          THIS_RUN="${{ github.run_id }}"
+          WORKFLOW="server-v2ray.yml"
+          echo "Checking older runs of $WORKFLOW..."
+          RUNS=$(gh run list --workflow "$WORKFLOW" -s in_progress -L 30 --json databaseId -q '.[].databaseId' 2>/dev/null || true)
+          for R in $RUNS; do
+            if [ "$R" != "$THIS_RUN" ]; then
+              echo "Cancelling older V2Ray run $R..."
+              gh run cancel "$R" || true
+            fi
+          done
+
+      # ── Watchdog & Keep-Alive Loop ──────────────────────────────────────────
+      - name: Keep Alive & Process Watchdog
+        run: |
+          THIS_WORKFLOW="server-v2ray.yml"
+          TARGET_DURATION=${{ github.event.inputs.duration_minutes || 345 }}
+          TOTAL_SECONDS=$((TARGET_DURATION * 60))
+          INTERVAL=30
+          ELAPSED=0
+
+          echo "V2Ray Server running for $TARGET_DURATION minutes ($TOTAL_SECONDS s)."
+
+          while [ $ELAPSED -lt $TOTAL_SECONDS ]; do
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+
+            # Auto-heal V2Ray Core if killed
+            if ! pgrep -f "v2ray run" > /dev/null; then
+              echo "[WATCHDOG] V2Ray Core died! Restarting..."
+              sudo nohup /usr/local/bin/v2ray run -c /etc/v2ray/config.json -format jsonv4 > /var/log/v2ray.log 2>&1 &
+            fi
+
+            # Auto-heal Proxy Bridge if killed
+            if ! pgrep -f "proxy_v2ray_bin" > /dev/null; then
+              echo "[WATCHDOG] proxy_v2ray_bin died! Restarting..."
+              if [ -f proxy_v2ray_bin ]; then
+                sudo nohup ./proxy_v2ray_bin --listen 0.0.0.0:8080 --vless 127.0.0.1:10085 --vmess 127.0.0.1:10086 --name "V2Ray Node" > /var/log/proxy_v2ray.log 2>&1 &
+              fi
+            fi
+
+            # Auto-heal Cloudflared if killed
+            if ! pgrep -f "cloudflared" > /dev/null; then
+              echo "[WATCHDOG] Cloudflared died! Restarting..."
+              CF_TOKEN="${{ secrets.CLOUDFLARE_TUNNEL_TOKEN_V2RAY || secrets.CLOUDFLARE_TUNNEL_TOKEN }}"
+              if [ -n "$CF_TOKEN" ]; then
+                cloudflared tunnel --protocol quic run --token "$CF_TOKEN" > /dev/null 2>&1 &
+              else
+                cloudflared tunnel --url http://127.0.0.1:8080 > cf_tunnel.log 2>&1 &
+              fi
+            fi
+          done
+
+          # Seamless Self-Restart hand-off
+          echo "[LIFECYCLE] V2Ray reached end of shift ($TARGET_DURATION m). Initiating hand-off..."
+          SELF_ACT=$(gh run list --workflow "$THIS_WORKFLOW" -s in_progress -L 5 --json databaseId -q 'length' 2>/dev/null || echo "1")
+          SELF_QUE=$(gh run list --workflow "$THIS_WORKFLOW" -s queued -L 5 --json databaseId -q 'length' 2>/dev/null || echo "0")
+          SELF_TOT=$((SELF_ACT + SELF_QUE))
+
+          if [ "$SELF_TOT" -le 1 ]; then
+            echo "[LIFECYCLE] Dispatching replacement run of V2Ray (345m shift)..."
+            gh workflow run "$THIS_WORKFLOW" -f duration_minutes=345 || true
+            sleep 45
+          fi
+          echo "V2Ray shift ended cleanly."

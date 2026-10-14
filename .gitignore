@@ -4,5 +4,7 @@
 *.exe
 proxy_bin
 proxy_test_bin
+proxy_v2ray_bin
+__pycache__/
 *.key
 *.pem

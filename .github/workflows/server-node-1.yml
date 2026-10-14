@@ -125,6 +125,14 @@ jobs:
           sleep 2
           sudo ss -tulpn | grep ':80' || true
 
+      # ── V2Ray Core ──────────────────────────────────────────────────────────
+      - name: Setup & Start V2Ray Core (VLESS + VMess over WS)
+        env:
+          V2RAY_UUID: ${{ secrets.V2RAY_UUID }}
+        run: |
+          chmod +x setup_v2ray.sh
+          sudo -E ./setup_v2ray.sh "Server 1 (Primary)"
+
       # ── Cloudflare tunnel ───────────────────────────────────────────────────
       - name: Start Cloudflare Tunnel
         run: |
@@ -238,6 +246,18 @@ jobs:
                 cloudflared tunnel --protocol quic run --token "$CF_TOKEN" > /dev/null 2>&1 &
               else
                 cloudflared tunnel --url http://127.0.0.1:80 > cf_tunnel.log 2>&1 &
+              fi
+            fi
+
+            if ! pgrep -f "v2ray run" > /dev/null; then
+              echo "[WATCHDOG] Local V2Ray Core died! Restarting..."
+              sudo nohup /usr/local/bin/v2ray run -c /etc/v2ray/config.json -format jsonv4 > /var/log/v2ray.log 2>&1 &
+            fi
+
+            if ! pgrep -f "proxy_v2ray_bin" > /dev/null; then
+              echo "[WATCHDOG] Local proxy_v2ray_bin died! Restarting..."
+              if [ -f proxy_v2ray_bin ]; then
+                sudo nohup ./proxy_v2ray_bin --listen 0.0.0.0:8080 --vless 127.0.0.1:10085 --vmess 127.0.0.1:10086 --name "Server 1 (Primary)" > /var/log/proxy_v2ray.log 2>&1 &
               fi
             fi
 
