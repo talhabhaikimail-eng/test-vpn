@@ -30,6 +30,15 @@ on:
         options:
           - token
           - quick
+      cf_protocol:
+        description: 'cloudflared transport: auto (QUIC, falls back to HTTP/2), quic, or http2'
+        required: false
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - quic
+          - http2
 
 permissions:
   contents: write
@@ -67,6 +76,7 @@ jobs:
       GH_TOKEN: ${{ secrets.PAT_TOKEN }}
       CF_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN_V2RAY || secrets.CLOUDFLARE_TUNNEL_TOKEN }}
       CF_MODE: ${{ github.event.inputs.tunnel_mode || 'token' }}
+      CF_PROTOCOL: ${{ github.event.inputs.cf_protocol || 'auto' }}
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -86,7 +96,7 @@ jobs:
             pkill -f "cloudflared tunnel" 2>/dev/null || true
             sleep 1
             if [ "$CF_MODE" = "token" ] && [ -n "$CF_TOKEN" ]; then
-              nohup cloudflared tunnel --no-autoupdate --protocol auto --metrics 127.0.0.1:20241 \
+              nohup cloudflared tunnel --no-autoupdate --protocol "$CF_PROTOCOL" --metrics 127.0.0.1:20241 \
                 run --token "$CF_TOKEN" >> cf_tunnel.log 2>&1 &
             else
               nohup cloudflared tunnel --no-autoupdate --metrics 127.0.0.1:20241 \
@@ -267,7 +277,7 @@ jobs:
 
           if [ "${OTHERS:-0}" -eq 0 ]; then
             echo "[LIFECYCLE] Dispatching replacement run of V2Ray (345m shift)..."
-            gh workflow run "$THIS_WORKFLOW" -f duration_minutes=345 -f tunnel_mode="$CF_MODE" || true
+            gh workflow run "$THIS_WORKFLOW" -f duration_minutes=345 -f tunnel_mode="$CF_MODE" -f cf_protocol="$CF_PROTOCOL" || true
           fi
           echo "[LIFECYCLE] Serving until the replacement takes over (max 8m)..."
           sleep 480
