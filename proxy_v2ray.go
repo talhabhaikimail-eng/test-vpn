@@ -1,7 +1,21 @@
+// proxy_v2ray: the single port cloudflared (or Render) forwards to. It routes
+// every request to the right Xray inbound and keeps the TCP path tuned:
+//
+//	WebSocket upgrade  /vless, /          -> VLESS WS inbound   (raw splice after hijack)
+//	WebSocket upgrade  /vmess             -> VMess WS inbound   (raw splice after hijack)
+//	plain HTTP         /xh, /xh/...       -> VLESS XHTTP inbound (HTTP reverse proxy)
+//	plain HTTP         /health, /ping     -> answered here
+//	plain HTTP         anything else      -> optional web panel (--http) or 404
+//
+// Why an HTTP-aware router instead of a byte splice on the first request line:
+// cloudflared pools keep-alive connections to the origin and reuses one for any
+// later non-WebSocket request. With a per-connection splice, a connection first
+// used for /xh would later carry a /health or panel request into the XHTTP
+// inbound. net/http routes per request, so pooled connections stay correct.
+// WebSockets consume their connection, so hijack + splice is exact for them.
 package main
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -9,7 +23,11 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -18,6 +36,8 @@ import (
 const (
 	maxHeaderBytes   = 8192
 	handshakeTimeout = 5 * time.Second
+	dialTimeout      = 3 * time.Second
+	idleTimeout      = 120 * time.Second // cloudflared keeps origin connections warm
 	keepAlivePeriod  = 15 * time.Second
 	maxUptimeHours   = 6
 )
@@ -35,9 +55,11 @@ func serverBanner() string {
 	if remaining < 0 {
 		remaining = 0
 	}
-	return fmt.Sprintf("[%s] V2Ray WS+TLS | Started: %s | Restarts in %dh %02dm",
+	return fmt.Sprintf("[%s] Xray WS+XHTTP | Started: %s | Restarts in %dh %02dm",
 		nodeName, startedStr, int(remaining.Hours()), int(remaining.Minutes())%60)
 }
+
+// ── TCP tuning ───────────────────────────────────────────────────────────────
 
 func tune(c *net.TCPConn) {
 	_ = c.SetNoDelay(true)
@@ -46,207 +68,252 @@ func tune(c *net.TCPConn) {
 	setQuickAck(c)
 }
 
-func forward(dst, src *net.TCPConn, done chan<- struct{}) {
+// rawTCP unwraps the *net.TCPConn behind a connection handed out by limitListener.
+func rawTCP(c net.Conn) *net.TCPConn {
+	switch v := c.(type) {
+	case *net.TCPConn:
+		return v
+	case *limitedConn:
+		return v.TCPConn
+	}
+	return nil
+}
+
+type halfCloser interface {
+	net.Conn
+	CloseWrite() error
+}
+
+func forward(dst, src halfCloser, done chan<- struct{}) {
 	defer func() {
 		_ = dst.CloseWrite()
 		done <- struct{}{}
 	}()
-
-	setQuickAck(src)
+	if tc := rawTCP(src); tc != nil {
+		setQuickAck(tc) // one-shot on Linux; re-arm as streaming starts
+	}
 	_, _ = io.Copy(dst, src)
 }
 
-// isWebSocketUpgrade reports whether the request headers carry "Upgrade: websocket".
-func isWebSocketUpgrade(headerData []byte) bool {
-	for _, line := range bytes.Split(headerData, []byte("\r\n")) {
-		k, v, ok := bytes.Cut(line, []byte(":"))
-		if ok && bytes.EqualFold(bytes.TrimSpace(k), []byte("upgrade")) &&
-			bytes.Contains(bytes.ToLower(v), []byte("websocket")) {
-			return true
-		}
-	}
-	return false
+// ── Listener: TCP tuning on accept + max-conns guard ─────────────────────────
+
+type limitListener struct {
+	*net.TCPListener
+	sem chan struct{}
 }
 
-func handleClient(client *net.TCPConn, vlessAddr, vmessAddr, httpAddr *net.TCPAddr) {
-	defer client.Close()
-	tune(client)
+type limitedConn struct {
+	*net.TCPConn
+	once    sync.Once
+	release func()
+}
 
-	_ = client.SetReadDeadline(time.Now().Add(handshakeTimeout))
+func (c *limitedConn) Close() error {
+	c.once.Do(c.release)
+	return c.TCPConn.Close()
+}
 
-	headerBuf := make([]byte, maxHeaderBytes)
-	n := 0
-	headerEnd := -1
-
-	for n < maxHeaderBytes {
-		nr, err := client.Read(headerBuf[n:])
+func (l *limitListener) Accept() (net.Conn, error) {
+	for {
+		c, err := l.AcceptTCP()
 		if err != nil {
-			return
+			return nil, err
 		}
-		n += nr
-		idx := bytes.Index(headerBuf[:n], []byte("\r\n\r\n"))
-		if idx != -1 {
-			headerEnd = idx
-			break
+		select {
+		case l.sem <- struct{}{}:
+		default:
+			log.Printf("at capacity (%d), dropping %s", cap(l.sem), c.RemoteAddr())
+			_ = c.Close()
+			continue
 		}
+		tune(c)
+		return &limitedConn{TCPConn: c, release: func() { <-l.sem }}, nil
 	}
+}
 
-	if headerEnd == -1 {
-		return
+// ── Router ───────────────────────────────────────────────────────────────────
+
+type router struct {
+	vless, vmess string
+	xhttpPrefix  string
+	xhttp, ui    *httputil.ReverseProxy
+	hijacked     sync.WaitGroup
+}
+
+func newReverseProxy(target string) *httputil.ReverseProxy {
+	u := &url.URL{Scheme: "http", Host: target}
+	tr := &http.Transport{
+		DialContext:         (&net.Dialer{Timeout: dialTimeout, KeepAlive: keepAlivePeriod}).DialContext,
+		MaxIdleConns:        1024,
+		MaxIdleConnsPerHost: 1024,
+		IdleConnTimeout:     90 * time.Second,
+		DisableCompression:  true,
+		ForceAttemptHTTP2:   false,
 	}
-
-	headerData := headerBuf[:headerEnd]
-
-	// Extract path from request line: GET /path HTTP/1.1
-	firstLine := headerData
-	if crlf := bytes.Index(headerData, []byte("\r\n")); crlf != -1 {
-		firstLine = headerData[:crlf]
+	return &httputil.ReverseProxy{
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.SetURL(u)
+			pr.Out.Host = pr.In.Host // keep the public hostname (panel links, xhttp host check)
+		},
+		Transport:     tr,
+		FlushInterval: -1, // XHTTP download is a long streaming GET: never buffer
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			log.Printf("upstream %s %s: %v", target, r.URL.Path, err)
+			http.Error(w, "upstream unavailable", http.StatusBadGateway)
+		},
 	}
-	parts := bytes.Split(firstLine, []byte(" "))
-	path := []byte("/")
-	if len(parts) >= 2 {
-		path = parts[1]
-	}
+}
 
-	// 1. Health check endpoint
-	if bytes.Equal(path, []byte("/health")) || bytes.Equal(path, []byte("/ping")) {
-		banner := serverBanner()
-		body := fmt.Sprintf("OK - %s\n", banner)
-		resp := fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: %d\r\nX-Server-Info: %s\r\nConnection: close\r\n\r\n%s", len(body), banner, body)
-		_, _ = client.Write([]byte(resp))
-		return
-	}
+func isWebSocketUpgrade(r *http.Request) bool {
+	return strings.Contains(strings.ToLower(r.Header.Get("Upgrade")), "websocket")
+}
 
-	// 2. Route: plain HTTP -> web UI (if enabled), WebSocket -> V2Ray inbound by path
-	isWS := isWebSocketUpgrade(headerData)
-	targetAddr := vlessAddr
+func (rt *router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	p := r.URL.Path
 	switch {
-	case !isWS && httpAddr != nil:
-		targetAddr = httpAddr
-	case bytes.HasPrefix(path, []byte("/vmess")) && vmessAddr != nil:
-		targetAddr = vmessAddr
+	case p == "/health" || p == "/ping":
+		banner := serverBanner()
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("X-Server-Info", banner)
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = fmt.Fprintf(w, "OK - %s\n", banner)
+	case isWebSocketUpgrade(r):
+		rt.serveWebSocket(w, r)
+	case rt.xhttp != nil && (p == rt.xhttpPrefix || strings.HasPrefix(p, rt.xhttpPrefix+"/")):
+		rt.xhttp.ServeHTTP(w, r)
+	case rt.ui != nil:
+		rt.ui.ServeHTTP(w, r)
+	default:
+		http.NotFound(w, r)
 	}
+}
 
-	_ = client.SetReadDeadline(time.Time{})
-
-	upstream, err := net.DialTCP("tcp", nil, targetAddr)
-	if err != nil {
-		log.Printf("dial upstream %s: %v", targetAddr, err)
+// serveWebSocket hijacks the client connection, replays the upgrade request to
+// the Xray WS inbound on path "/" and splices bytes both ways. Early data in
+// Sec-WebSocket-Protocol and any frames the client sent right behind the
+// headers (already buffered by net/http) are forwarded untouched.
+func (rt *router) serveWebSocket(w http.ResponseWriter, r *http.Request) {
+	target := rt.vless
+	if rt.vmess != "" && strings.HasPrefix(r.URL.Path, "/vmess") {
+		target = rt.vmess
+	}
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "hijack unsupported", http.StatusInternalServerError)
 		return
 	}
-	defer upstream.Close()
+	up, err := net.DialTimeout("tcp", target, dialTimeout)
+	if err != nil {
+		log.Printf("dial upstream %s: %v", target, err)
+		http.Error(w, "upstream unavailable", http.StatusBadGateway)
+		return
+	}
+	upstream := up.(*net.TCPConn)
 	tune(upstream)
 
-	// Send initial HTTP request bytes; WebSocket requests get the path normalized for V2Ray Core
-	var forwardBuf bytes.Buffer
-	forwardBuf.Grow(n + 32)
-	if crlf := bytes.Index(headerBuf[:n], []byte("\r\n")); crlf != -1 && isWS {
-		forwardBuf.WriteString("GET / HTTP/1.1\r\n")
-		forwardBuf.Write(headerBuf[crlf+2 : n])
-	} else {
-		forwardBuf.Write(headerBuf[:n])
+	client, brw, err := hj.Hijack()
+	if err != nil {
+		_ = upstream.Close()
+		return
 	}
+	rt.hijacked.Add(1)
+	defer rt.hijacked.Done()
+	defer client.Close()
+	defer upstream.Close()
+	_ = client.SetDeadline(time.Time{})
 
-	if _, err := upstream.Write(forwardBuf.Bytes()); err != nil {
+	var b strings.Builder
+	b.Grow(1024)
+	b.WriteString("GET / HTTP/1.1\r\nHost: ")
+	b.WriteString(r.Host)
+	b.WriteString("\r\n")
+	for k, vs := range r.Header {
+		for _, v := range vs {
+			b.WriteString(k)
+			b.WriteString(": ")
+			b.WriteString(v)
+			b.WriteString("\r\n")
+		}
+	}
+	b.WriteString("\r\n")
+	if n := brw.Reader.Buffered(); n > 0 {
+		early, _ := brw.Reader.Peek(n)
+		b.Write(early)
+	}
+	if _, err := io.WriteString(upstream, b.String()); err != nil {
 		return
 	}
 
-	// Full-duplex streaming with immediate teardown
+	cl, ok := client.(halfCloser)
+	if !ok {
+		return
+	}
 	done := make(chan struct{}, 2)
-	go forward(upstream, client, done)
-	go forward(client, upstream, done)
-
+	go forward(upstream, cl, done)
+	go forward(cl, upstream, done)
 	<-done
 }
 
+// ── main ─────────────────────────────────────────────────────────────────────
+
 func main() {
-	listen    := flag.String("listen",    "0.0.0.0:8080",   "listen address for Cloudflare Tunnel reverse proxy")
-	vless     := flag.String("vless",     "127.0.0.1:10085", "upstream V2Ray VLESS WS address")
-	vmess     := flag.String("vmess",     "127.0.0.1:10086", "upstream V2Ray VMess WS address")
-	httpUp    := flag.String("http",      "",                "optional upstream for non-WebSocket requests (web UI)")
-	maxConns  := flag.Int("max-conns",    2048,              "max concurrent connections")
-	name      := flag.String("name",      "V2Ray Node 1",    "server instance name")
+	listen := flag.String("listen", "0.0.0.0:8080", "listen address for Cloudflare Tunnel reverse proxy")
+	vless := flag.String("vless", "127.0.0.1:10085", "upstream VLESS WS inbound")
+	vmess := flag.String("vmess", "127.0.0.1:10086", "upstream VMess WS inbound (empty to disable)")
+	xhttp := flag.String("xhttp", "127.0.0.1:10087", "upstream VLESS XHTTP inbound (empty to disable)")
+	xhttpPath := flag.String("xhttp-path", "/xh", "path prefix routed to the XHTTP inbound")
+	httpUp := flag.String("http", "", "optional upstream for other plain HTTP requests (web panel)")
+	maxConns := flag.Int("max-conns", 2048, "max concurrent connections")
+	name := flag.String("name", "V2Ray Node 1", "server instance name")
 	flag.Parse()
 	nodeName = *name
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	listenAddr, err := net.ResolveTCPAddr("tcp", *listen)
+	rt := &router{vless: *vless, vmess: *vmess, xhttpPrefix: strings.TrimSuffix(*xhttpPath, "/")}
+	if *xhttp != "" {
+		rt.xhttp = newReverseProxy(*xhttp)
+	}
+	if *httpUp != "" {
+		rt.ui = newReverseProxy(*httpUp)
+	}
+
+	addr, err := net.ResolveTCPAddr("tcp", *listen)
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	vlessAddr, err := net.ResolveTCPAddr("tcp", *vless)
-	if err != nil {
-		log.Fatalf("resolve vless %s: %v", *vless, err)
-	}
-
-	var vmessAddr *net.TCPAddr
-	if *vmess != "" {
-		vmessAddr, err = net.ResolveTCPAddr("tcp", *vmess)
-		if err != nil {
-			log.Fatalf("resolve vmess %s: %v", *vmess, err)
-		}
-	}
-
-	var httpAddr *net.TCPAddr
-	if *httpUp != "" {
-		httpAddr, err = net.ResolveTCPAddr("tcp", *httpUp)
-		if err != nil {
-			log.Fatalf("resolve http %s: %v", *httpUp, err)
-		}
-	}
-
-	ln, err := net.ListenTCP("tcp", listenAddr)
+	tl, err := net.ListenTCP("tcp", addr)
 	if err != nil {
 		log.Fatalf("bind %s: %v", *listen, err)
 	}
-	go func() { <-ctx.Done(); ln.Close() }()
+	ln := &limitListener{TCPListener: tl, sem: make(chan struct{}, *maxConns)}
 
-	log.Printf("[V2Ray-Proxy] %s -> VLESS:%s | VMess:%s (max-conns=%d)", *listen, *vless, *vmess, *maxConns)
-	log.Printf("[V2Ray-Proxy] %s", serverBanner())
-
-	sem := make(chan struct{}, *maxConns)
-	var active sync.WaitGroup
-	var backoff time.Duration
-
-	for {
-		conn, err := ln.AcceptTCP()
-		if err != nil {
-			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
-				break
-			}
-			if backoff == 0 {
-				backoff = 5 * time.Millisecond
-			} else if backoff *= 2; backoff > time.Second {
-				backoff = time.Second
-			}
-			log.Printf("accept error (retry in %v): %v", backoff, err)
-			time.Sleep(backoff)
-			continue
-		}
-		backoff = 0
-
-		select {
-		case sem <- struct{}{}:
-		default:
-			log.Printf("at capacity (%d), dropping %s", *maxConns, conn.RemoteAddr())
-			conn.Close()
-			continue
-		}
-
-		active.Add(1)
-		go func(c *net.TCPConn) {
-			defer active.Done()
-			defer func() { <-sem }()
-			handleClient(c, vlessAddr, vmessAddr, httpAddr)
-		}(conn)
+	srv := &http.Server{
+		Handler:           rt,
+		ReadHeaderTimeout: handshakeTimeout,
+		IdleTimeout:       idleTimeout,
+		MaxHeaderBytes:    maxHeaderBytes,
 	}
 
-	log.Println("shutting down, draining active connections (10s max)...")
+	log.Printf("[V2Ray-Proxy] %s -> VLESS-WS:%s | VMess-WS:%s | XHTTP:%s%s | panel:%s (max-conns=%d)",
+		*listen, *vless, *vmess, *xhttp, rt.xhttpPrefix, *httpUp, *maxConns)
+	log.Printf("[V2Ray-Proxy] %s", serverBanner())
+
+	go func() {
+		<-ctx.Done()
+		log.Println("shutting down, draining active connections (10s max)...")
+		sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(sctx)
+	}()
+
+	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatal(err)
+	}
+
 	done := make(chan struct{})
-	go func() { active.Wait(); close(done) }()
+	go func() { rt.hijacked.Wait(); close(done) }()
 	select {
 	case <-done:
 		log.Println("clean shutdown.")

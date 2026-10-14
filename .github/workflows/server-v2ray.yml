@@ -128,7 +128,7 @@ jobs:
           echo "BBR: $(cat /proc/sys/net/ipv4/tcp_congestion_control)"
 
       # ── V2Ray Core Setup ────────────────────────────────────────────────────
-      - name: Setup & Start V2Ray Core (VLESS + VMess over WS)
+      - name: Setup & Start Xray-core (VLESS XHTTP + VLESS/VMess WS)
         env:
           V2RAY_UUID: ${{ secrets.V2RAY_UUID }}
         run: |
@@ -224,7 +224,7 @@ jobs:
 
           start_proxy() {
             sudo pkill -f "proxy_v2ray_bin" 2>/dev/null || true
-            sudo nohup ./proxy_v2ray_bin --listen 0.0.0.0:8080 --vless 127.0.0.1:10085 --vmess 127.0.0.1:10086 --name "V2Ray Node" > /var/log/proxy_v2ray.log 2>&1 &
+            sudo nohup ./proxy_v2ray_bin --listen 0.0.0.0:8080 --vless 127.0.0.1:10085 --vmess 127.0.0.1:10086 --xhttp 127.0.0.1:10087 --name "V2Ray Node" > /var/log/proxy_v2ray.log 2>&1 &
           }
 
           echo "V2Ray Server running for $TARGET_DURATION minutes ($TOTAL_SECONDS s)."
@@ -233,9 +233,9 @@ jobs:
             sleep $INTERVAL
             ELAPSED=$((ELAPSED + INTERVAL))
 
-            # V2Ray Core: process alive AND inbounds listening
-            if ! pgrep -f "v2ray run" > /dev/null || ! ss -ltn | grep -q '127.0.0.1:10085 '; then
-              echo "[WATCHDOG] V2Ray Core down! Restarting..."
+            # Xray (started through the /usr/local/bin/v2ray symlink): process alive AND inbounds listening
+            if ! pgrep -f "v2ray run" > /dev/null || ! ss -ltn | grep -q '127.0.0.1:10085 ' || ! ss -ltn | grep -q '127.0.0.1:10087 '; then
+              echo "[WATCHDOG] Xray down! Restarting..."
               sudo pkill -f "v2ray run" 2>/dev/null || true
               sudo nohup /usr/local/bin/v2ray run -c /etc/v2ray/config.json -format json > /var/log/v2ray.log 2>&1 &
             fi

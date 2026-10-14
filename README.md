@@ -29,6 +29,27 @@ To prevent downtime from runner restarts, network freezes, or single-point crash
    - Server 1 runs on the permanent custom domain.
    - Server 2 runs on Cloudflare's own free Quick Tunnel (`trycloudflare.com`), requiring no extra domain or token.
 
+## V2Ray / Xray Node (XHTTP + WebSocket)
+
+[server-v2ray.yml](file:///.github/workflows/server-v2ray.yml) runs Xray-core behind the same Cloudflare Tunnel pattern
+(`v2ray.ufone-claim.site`, tracked in [live_domain_v2ray.txt](file:///live_domain_v2ray.txt)). Transports:
+
+| Transport | Path | Use it for |
+| :--- | :--- | :--- |
+| **VLESS XHTTP** (`mode=packet-up`) | `/xh` | Recommended. Xray clients: v2rayNG, v2rayN, Hiddify, Streisand, Shadowrocket. |
+| VLESS WS (early data) | `/vless?ed=2048` | Any V2Ray client. Enable the client's **Mux** (concurrency 8). |
+| VMess WS (early data) | `/vmess?ed=2048` | NetMod, NapsternetV. Enable Mux if available. |
+
+Why XHTTP: measured from Pakistan, a plain HTTP request through the tunnel round-trips in ~300 ms, but a WebSocket
+upgrade takes ~900 ms (Cloudflare opens a fresh inter-colo connection per WebSocket; `Server-Timing: cfOrigin` shows it).
+Every new proxied TCP connection is a new WebSocket, so each one paid ~1 s before data flowed. XHTTP uses plain requests
+and multiplexes sessions over warm HTTP/2 connections, so a new session starts in about one round trip.
+
+```bash
+python generate_v2ray_links.py            # import links (XHTTP, VLESS WS, VMess WS, bug-host variants)
+python test_v2ray.py --data --ed -n 10    # WS end-to-end TTFB benchmark (VLESS)
+```
+
 ## Testing & Benchmarking
 
 Use the built-in [test_proxy.py](file:///test_proxy.py) benchmark tool:
