@@ -1,2 +1,2 @@
 tunnel.ufone-claim.site
-animation-springs-amber-isbn.trycloudflare.com
+tunnel2.ufone-claim.site
