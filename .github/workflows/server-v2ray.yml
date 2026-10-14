@@ -36,11 +36,37 @@ permissions:
   actions: write
 
 jobs:
+  # ── Schedule guard: cron is only a safety net, never restart a live node ──
+  guard:
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+    env:
+      GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+    steps:
+      - name: Skip scheduled run if a V2Ray node is already live
+        id: check
+        run: |
+          SKIP=false
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            OTHERS=$(gh run list -R "${{ github.repository }}" --workflow server-v2ray.yml -L 20 \
+              --json databaseId,status -q '[.[] | select((.status=="in_progress" or .status=="queued") and .databaseId != ${{ github.run_id }})] | length' 2>/dev/null || echo 0)
+            if [ "${OTHERS:-0}" -gt 0 ]; then
+              echo "A V2Ray run is already active/queued ($OTHERS); scheduled run will not interrupt it."
+              SKIP=true
+            fi
+          fi
+          echo "skip=$SKIP" >> "$GITHUB_OUTPUT"
+
   server-v2ray:
+    needs: guard
+    if: needs.guard.outputs.skip != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
       GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+      CF_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN_V2RAY || secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+      CF_MODE: ${{ github.event.inputs.tunnel_mode || 'token' }}
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -51,6 +77,28 @@ jobs:
           curl -sSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
           chmod +x cloudflared
           sudo mv cloudflared /usr/local/bin/cloudflared
+
+          # Shared helpers for the tunnel and watchdog steps.
+          # --protocol auto = QUIC first, falls back to HTTP/2 if UDP is degraded.
+          # --metrics exposes /ready (200 only while >=1 edge connection is registered).
+          cat > "$RUNNER_TEMP/cf.sh" <<'EOF'
+          start_cf() {
+            pkill -f "cloudflared tunnel" 2>/dev/null || true
+            sleep 1
+            if [ "$CF_MODE" = "token" ] && [ -n "$CF_TOKEN" ]; then
+              nohup cloudflared tunnel --no-autoupdate --protocol auto --metrics 127.0.0.1:20241 \
+                run --token "$CF_TOKEN" >> cf_tunnel.log 2>&1 &
+            else
+              nohup cloudflared tunnel --no-autoupdate --metrics 127.0.0.1:20241 \
+                --url http://127.0.0.1:8080 > cf_tunnel.log 2>&1 &
+            fi
+          }
+          cf_ready() { curl -fsS -m 3 http://127.0.0.1:20241/ready > /dev/null 2>&1; }
+          wait_cf_ready() {
+            for _ in $(seq 1 "${1:-45}"); do cf_ready && return 0; sleep 1; done
+            return 1
+          }
+          EOF
 
       # ── TCP tuning ──────────────────────────────────────────────────────────
       - name: Tune TCP Stack (BDP Optimized for High-Latency Links)
@@ -66,6 +114,7 @@ jobs:
           sudo sysctl -w net.core.netdev_max_backlog=5000
           sudo sysctl -w net.core.somaxconn=4096
           sudo sysctl -w net.ipv4.tcp_slow_start_after_idle=0
+          sudo sysctl -w net.ipv4.tcp_mtu_probing=1
           echo "BBR: $(cat /proc/sys/net/ipv4/tcp_congestion_control)"
 
       # ── V2Ray Core Setup ────────────────────────────────────────────────────
@@ -76,26 +125,33 @@ jobs:
           chmod +x setup_v2ray.sh
           sudo -E ./setup_v2ray.sh "V2Ray Node"
 
+          # Fail fast if the local chain is broken, before we take traffic from the old node.
+          for _ in $(seq 1 10); do
+            curl -fsS -m 3 http://127.0.0.1:8080/health && break
+            sleep 1
+          done
+          curl -fsS -m 3 http://127.0.0.1:8080/health > /dev/null || { echo "proxy_v2ray_bin not healthy"; sudo tail -50 /var/log/proxy_v2ray.log /var/log/v2ray.log; exit 1; }
+
       # ── Cloudflare Tunnel ───────────────────────────────────────────────────
       - name: Start Cloudflare Tunnel
         run: |
-          MODE="${{ github.event.inputs.tunnel_mode || 'token' }}"
-          CF_TOKEN="${{ secrets.CLOUDFLARE_TUNNEL_TOKEN_V2RAY || secrets.CLOUDFLARE_TUNNEL_TOKEN }}"
+          . "$RUNNER_TEMP/cf.sh"
+          start_cf
 
-          if [ "$MODE" = "token" ] && [ -n "$CF_TOKEN" ]; then
-            echo "Starting named Cloudflare tunnel with token..."
-            cloudflared tunnel --protocol quic run --token "$CF_TOKEN" > cf_tunnel.log 2>&1 &
-            sleep 8
+          if ! wait_cf_ready 60; then
+            echo "cloudflared never became ready:"; tail -50 cf_tunnel.log; exit 1
+          fi
+          echo "cloudflared ready: $(grep -c 'Registered tunnel connection' cf_tunnel.log) edge connection(s)"
+
+          if [ "$CF_MODE" = "token" ] && [ -n "$CF_TOKEN" ]; then
             CUSTOM="${{ github.event.inputs.custom_domain || secrets.CUSTOM_DOMAIN_V2RAY }}"
             if [ -z "$CUSTOM" ] && [ -f live_domain_v2ray.txt ]; then
               CUSTOM=$(cat live_domain_v2ray.txt | tr -d '\r' | xargs)
             fi
             DOMAIN="${CUSTOM:-v2ray.ufone-claim.site}"
-            echo "DOMAIN=$DOMAIN" >> $GITHUB_ENV
           else
-            echo "Starting Cloudflare quick tunnel (trycloudflare.com) on port 8080..."
-            cloudflared tunnel --url http://127.0.0.1:8080 > cf_tunnel.log 2>&1 &
-            for i in $(seq 1 30); do
+            CF_URL=""
+            for _ in $(seq 1 30); do
               CF_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' cf_tunnel.log | head -n 1)
               [ -n "$CF_URL" ] && break
               sleep 1
@@ -104,8 +160,8 @@ jobs:
               echo "Failed to obtain trycloudflare URL"; exit 1
             fi
             DOMAIN=$(echo "$CF_URL" | sed 's|https://||')
-            echo "DOMAIN=$DOMAIN" >> $GITHUB_ENV
           fi
+          echo "DOMAIN=$DOMAIN" >> $GITHUB_ENV
 
           # Update live_domain_v2ray.txt
           git config user.name "github-actions[bot]"
@@ -128,14 +184,17 @@ jobs:
         run: echo "V2Ray Node live on ${{ env.DOMAIN }}"
 
       # ── Concurrency Guard ───────────────────────────────────────────────────
+      # Runs only after this node's tunnel is /ready, and only cancels OLDER runs
+      # (lower run id), so the hand-off has no gap and two runs never cancel each other.
       - name: Cancel Older Runs of V2Ray Workflow
         run: |
           THIS_RUN="${{ github.run_id }}"
           WORKFLOW="server-v2ray.yml"
-          echo "Checking older runs of $WORKFLOW..."
+          # Give the edge a moment to start routing to the new connector.
+          sleep 10
           RUNS=$(gh run list --workflow "$WORKFLOW" -s in_progress -L 30 --json databaseId -q '.[].databaseId' 2>/dev/null || true)
           for R in $RUNS; do
-            if [ "$R" != "$THIS_RUN" ]; then
+            if [ "$R" -lt "$THIS_RUN" ]; then
               echo "Cancelling older V2Ray run $R..."
               gh run cancel "$R" || true
             fi
@@ -144,11 +203,19 @@ jobs:
       # ── Watchdog & Keep-Alive Loop ──────────────────────────────────────────
       - name: Keep Alive & Process Watchdog
         run: |
+          . "$RUNNER_TEMP/cf.sh"
           THIS_WORKFLOW="server-v2ray.yml"
           TARGET_DURATION=${{ github.event.inputs.duration_minutes || 345 }}
           TOTAL_SECONDS=$((TARGET_DURATION * 60))
-          INTERVAL=30
+          INTERVAL=15
           ELAPSED=0
+          CF_FAILS=0
+          PROXY_FAILS=0
+
+          start_proxy() {
+            sudo pkill -f "proxy_v2ray_bin" 2>/dev/null || true
+            sudo nohup ./proxy_v2ray_bin --listen 0.0.0.0:8080 --vless 127.0.0.1:10085 --vmess 127.0.0.1:10086 --name "V2Ray Node" > /var/log/proxy_v2ray.log 2>&1 &
+          }
 
           echo "V2Ray Server running for $TARGET_DURATION minutes ($TOTAL_SECONDS s)."
 
@@ -156,41 +223,52 @@ jobs:
             sleep $INTERVAL
             ELAPSED=$((ELAPSED + INTERVAL))
 
-            # Auto-heal V2Ray Core if killed
-            if ! pgrep -f "v2ray run" > /dev/null; then
-              echo "[WATCHDOG] V2Ray Core died! Restarting..."
+            # V2Ray Core: process alive AND inbounds listening
+            if ! pgrep -f "v2ray run" > /dev/null || ! ss -ltn | grep -q '127.0.0.1:10085 '; then
+              echo "[WATCHDOG] V2Ray Core down! Restarting..."
+              sudo pkill -f "v2ray run" 2>/dev/null || true
               sudo nohup /usr/local/bin/v2ray run -c /etc/v2ray/config.json -format json > /var/log/v2ray.log 2>&1 &
             fi
 
-            # Auto-heal Proxy Bridge if killed
-            if ! pgrep -f "proxy_v2ray_bin" > /dev/null; then
-              echo "[WATCHDOG] proxy_v2ray_bin died! Restarting..."
-              if [ -f proxy_v2ray_bin ]; then
-                sudo nohup ./proxy_v2ray_bin --listen 0.0.0.0:8080 --vless 127.0.0.1:10085 --vmess 127.0.0.1:10086 --name "V2Ray Node" > /var/log/proxy_v2ray.log 2>&1 &
-              fi
+            # Proxy bridge: must actually answer /health (2 strikes)
+            if curl -fsS -m 3 http://127.0.0.1:8080/health > /dev/null 2>&1; then
+              PROXY_FAILS=0
+            else
+              PROXY_FAILS=$((PROXY_FAILS + 1))
+              echo "[WATCHDOG] proxy_v2ray_bin health check failed ($PROXY_FAILS/2)"
+            fi
+            if ! pgrep -f "proxy_v2ray_bin" > /dev/null || [ $PROXY_FAILS -ge 2 ]; then
+              echo "[WATCHDOG] Restarting proxy_v2ray_bin..."
+              start_proxy
+              PROXY_FAILS=0
             fi
 
-            # Auto-heal Cloudflared if killed
-            if ! pgrep -f "cloudflared" > /dev/null; then
-              echo "[WATCHDOG] Cloudflared died! Restarting..."
-              CF_TOKEN="${{ secrets.CLOUDFLARE_TUNNEL_TOKEN_V2RAY || secrets.CLOUDFLARE_TUNNEL_TOKEN }}"
-              if [ -n "$CF_TOKEN" ]; then
-                cloudflared tunnel --protocol quic run --token "$CF_TOKEN" > /dev/null 2>&1 &
-              else
-                cloudflared tunnel --url http://127.0.0.1:8080 > cf_tunnel.log 2>&1 &
-              fi
+            # Cloudflared: process alive AND registered with the edge (3 strikes = 45s)
+            if cf_ready; then
+              CF_FAILS=0
+            else
+              CF_FAILS=$((CF_FAILS + 1))
+              echo "[WATCHDOG] cloudflared not ready ($CF_FAILS/3)"
+            fi
+            if ! pgrep -f "cloudflared tunnel" > /dev/null || [ $CF_FAILS -ge 3 ]; then
+              echo "[WATCHDOG] Restarting cloudflared..."
+              tail -20 cf_tunnel.log || true
+              start_cf
+              wait_cf_ready 30 && echo "[WATCHDOG] cloudflared ready again" || echo "[WATCHDOG] cloudflared still not ready"
+              CF_FAILS=0
             fi
           done
 
-          # Seamless Self-Restart hand-off
+          # Seamless hand-off: start the replacement, keep serving until it cancels us
+          # (it does so only once its own tunnel is ready), so there is no zero-connector gap.
           echo "[LIFECYCLE] V2Ray reached end of shift ($TARGET_DURATION m). Initiating hand-off..."
-          SELF_ACT=$(gh run list --workflow "$THIS_WORKFLOW" -s in_progress -L 5 --json databaseId -q 'length' 2>/dev/null || echo "1")
-          SELF_QUE=$(gh run list --workflow "$THIS_WORKFLOW" -s queued -L 5 --json databaseId -q 'length' 2>/dev/null || echo "0")
-          SELF_TOT=$((SELF_ACT + SELF_QUE))
+          OTHERS=$(gh run list --workflow "$THIS_WORKFLOW" -L 20 --json databaseId,status \
+            -q '[.[] | select((.status=="in_progress" or .status=="queued") and .databaseId != ${{ github.run_id }})] | length' 2>/dev/null || echo 0)
 
-          if [ "$SELF_TOT" -le 1 ]; then
+          if [ "${OTHERS:-0}" -eq 0 ]; then
             echo "[LIFECYCLE] Dispatching replacement run of V2Ray (345m shift)..."
-            gh workflow run "$THIS_WORKFLOW" -f duration_minutes=345 || true
-            sleep 45
+            gh workflow run "$THIS_WORKFLOW" -f duration_minutes=345 -f tunnel_mode="$CF_MODE" || true
           fi
+          echo "[LIFECYCLE] Serving until the replacement takes over (max 8m)..."
+          sleep 480
           echo "V2Ray shift ended cleanly."

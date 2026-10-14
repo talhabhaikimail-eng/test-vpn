@@ -44,7 +44,7 @@ def load_defaults():
         except Exception:
             pass
 
-    uuid = os.environ.get("V2RAY_UUID") or "2b8a2e66-dfe2-44d8-b00b-6439eb9e9ddb"
+    uuid = os.environ.get("V2RAY_UUID") or ""
     uuid_file = os.path.join(script_dir, ".v2ray_uuid")
     if os.path.isfile(uuid_file):
         try:
@@ -198,6 +198,168 @@ def probe_single(target_host, bug_host="jsbl.com", port=443, path="/vless", time
 
     return metrics
 
+def _ws_frame(payload):
+    """Build a masked binary WebSocket frame (client -> server frames must be masked)."""
+    mask = os.urandom(4)
+    n = len(payload)
+    if n < 126:
+        hdr = bytes([0x82, 0x80 | n])
+    elif n < 65536:
+        hdr = bytes([0x82, 0x80 | 126]) + n.to_bytes(2, "big")
+    else:
+        hdr = bytes([0x82, 0x80 | 127]) + n.to_bytes(8, "big")
+    return hdr + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+
+def _recv_exact(s, buf, n):
+    while len(buf) < n:
+        chunk = s.recv(65536)
+        if not chunk:
+            raise ConnectionError("connection closed")
+        buf.extend(chunk)
+
+def _read_ws_payload(s, buf):
+    """Read one server WebSocket frame and return its payload (server frames are unmasked)."""
+    _recv_exact(s, buf, 2)
+    ln = buf[1] & 0x7F
+    off = 2
+    if ln == 126:
+        _recv_exact(s, buf, 4)
+        ln = int.from_bytes(buf[2:4], "big"); off = 4
+    elif ln == 127:
+        _recv_exact(s, buf, 10)
+        ln = int.from_bytes(buf[2:10], "big"); off = 10
+    _recv_exact(s, buf, off + ln)
+    opcode = buf[0] & 0x0F
+    payload = bytes(buf[off:off + ln])
+    del buf[:off + ln]
+    if opcode == 0x8:
+        raise ConnectionError("server sent WS close")
+    return payload
+
+def probe_vless_data(target_host, uuid_str, bug_host="jsbl.com", port=443, path="/vless",
+                     early_data=False, dest_host="www.gstatic.com", timeout=10.0):
+    """
+    Real end-to-end probe: WS upgrade + VLESS request to dest_host:80 + HTTP GET /generate_204.
+    Measures time-to-first-byte through V2Ray, i.e. the latency a client actually feels when
+    it opens a new proxied connection. With early_data=True the VLESS request rides inside the
+    upgrade (Sec-WebSocket-Protocol), saving one full round trip.
+    """
+    import uuid as uuidlib
+    m = {"tcp_ms": 0.0, "tls_ms": 0.0, "ws_ms": 0.0, "ttfb_ms": 0.0, "total_ms": 0.0,
+         "status_code": "", "cf_ray": "", "error": None, "success": False}
+    t_start = time.perf_counter()
+    connect_host = bug_host or target_host
+    try:
+        ip_addr = socket.getaddrinfo(connect_host, port, socket.AF_INET, socket.SOCK_STREAM)[0][4][0]
+    except Exception as e:
+        m["error"] = f"DNS Error ({connect_host}): {e}"
+        return m
+
+    dest = dest_host.encode()
+    http_req = f"GET /generate_204 HTTP/1.1\r\nHost: {dest_host}\r\nConnection: close\r\n\r\n".encode()
+    vless_req = (b"\x00" + uuidlib.UUID(uuid_str).bytes + b"\x00" + b"\x01" + (80).to_bytes(2, "big")
+                 + b"\x02" + bytes([len(dest)]) + dest + http_req)
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    try:
+        t0 = time.perf_counter()
+        s.connect((ip_addr, port))
+        m["tcp_ms"] = (time.perf_counter() - t0) * 1000.0
+        if port == 443:
+            t0 = time.perf_counter()
+            s = ssl.create_default_context().wrap_socket(s, server_hostname=target_host)
+            m["tls_ms"] = (time.perf_counter() - t0) * 1000.0
+
+        sep = "&" if "?" in path else "?"
+        req_path = f"{path}{sep}ed=2048" if early_data else path
+        headers = [
+            f"GET {req_path} HTTP/1.1",
+            f"Host: {target_host}",
+            "Upgrade: websocket",
+            "Connection: Upgrade",
+            f"Sec-WebSocket-Key: {base64.b64encode(os.urandom(16)).decode()}",
+            "Sec-WebSocket-Version: 13",
+            "User-Agent: V2RayBench/1.0",
+        ]
+        if early_data:
+            # Xray/v2ray early-data convention: base64url (no padding) in Sec-WebSocket-Protocol
+            headers.append("Sec-WebSocket-Protocol: " + base64.urlsafe_b64encode(vless_req).decode().rstrip("="))
+        t_ws = time.perf_counter()
+        s.sendall(("\r\n".join(headers) + "\r\n\r\n").encode())
+
+        buf = bytearray()
+        while b"\r\n\r\n" not in buf:
+            chunk = s.recv(4096)
+            if not chunk:
+                raise ConnectionError("closed during WS upgrade")
+            buf.extend(chunk)
+        m["ws_ms"] = (time.perf_counter() - t_ws) * 1000.0
+        head, _, rest = bytes(buf).partition(b"\r\n\r\n")
+        lines = head.decode("utf-8", "replace").splitlines()
+        m["status_code"] = lines[0].split()[1] if lines and len(lines[0].split()) > 1 else ""
+        for line in lines[1:]:
+            if line.lower().startswith("cf-ray:"):
+                m["cf_ray"] = line.split(":", 1)[1].strip()
+        if m["status_code"] != "101":
+            m["error"] = f"HTTP {m['status_code']}"
+            return m
+        buf = bytearray(rest)
+
+        if not early_data:
+            s.sendall(_ws_frame(vless_req))
+
+        # First frame: VLESS response header (ver, addons len, addons) possibly followed by data
+        data = bytearray()
+        payload = _read_ws_payload(s, buf)
+        if not payload or payload[0] != 0:
+            raise ConnectionError("bad VLESS response (wrong UUID?)")
+        data.extend(payload[2 + payload[1]:])
+        while not data:
+            data.extend(_read_ws_payload(s, buf))
+        m["ttfb_ms"] = (time.perf_counter() - t_ws) * 1000.0
+        if b"204" not in data.split(b"\r\n", 1)[0]:
+            m["error"] = f"Unexpected upstream reply: {bytes(data[:40])!r}"
+            return m
+        m["success"] = True
+    except socket.timeout:
+        m["error"] = f"Timeout ({timeout}s)"
+    except Exception as e:
+        m["error"] = f"{type(e).__name__}: {e}"
+    finally:
+        m["total_ms"] = (time.perf_counter() - t_start) * 1000.0
+        try: s.close()
+        except Exception: pass
+    return m
+
+def run_data_benchmark(target_host, uuid_str, bug_host, port, path, num_probes, early_data):
+    default_d, default_u = load_defaults()
+    target_host = target_host or default_d
+    uuid_str = uuid_str or default_u
+    if not uuid_str:
+        print(f"{CLR_RED}--data needs a UUID: pass --uuid, set V2RAY_UUID, or create .v2ray_uuid{CLR_RESET}")
+        return
+    print(f"\n{CLR_BOLD}{CLR_CYAN}VLESS END-TO-END DATA PROBE{CLR_RESET}  {target_host}{path}  "
+          f"bug-host={bug_host or 'direct'}  early-data={'ON' if early_data else 'off'}")
+    print(f" {'Probe':<6} {'Status':<6} {'TLS':>9} {'WS 101':>9} {'TTFB':>9} {'Total':>9}  Info")
+    results = []
+    for i in range(1, num_probes + 1):
+        r = probe_vless_data(target_host, uuid_str, bug_host, port, path, early_data)
+        results.append(r)
+        st = f"{CLR_GREEN}PASS{CLR_RESET}" if r["success"] else f"{CLR_RED}FAIL{CLR_RESET}"
+        info = r["cf_ray"] if r["success"] else f"{CLR_RED}{r['error']}{CLR_RESET}"
+        print(f" #{i:<5} {st}  {r['tls_ms']:>7.1f}ms {r['ws_ms']:>7.1f}ms {r['ttfb_ms']:>7.1f}ms {r['total_ms']:>7.1f}ms  {info}")
+        time.sleep(0.15)
+    ok = [r for r in results if r["success"]]
+    print(f" Passed {len(ok)}/{len(results)}", end="")
+    if ok:
+        ttfb = [r["ttfb_ms"] for r in ok]
+        jit = statistics.stdev(ttfb) if len(ttfb) > 1 else 0.0
+        print(f" | TTFB median {statistics.median(ttfb):.1f} ms (min {min(ttfb):.1f}, max {max(ttfb):.1f}, jitter {jit:.1f})")
+    else:
+        print()
+
 def run_benchmark(target_host, bug_host, port=443, path="/vless", num_probes=10, hold_seconds=0, concurrency=1):
     default_d, default_u = load_defaults()
     target_host = target_host or default_d
@@ -315,7 +477,14 @@ def main():
     parser.add_argument("-n", "--probes", type=int, default=10, help="Number of benchmark probes")
     parser.add_argument("-c", "--concurrency", type=int, default=1, help="Concurrent workers")
     parser.add_argument("--hold", type=int, default=0, help="Idle socket stability hold in seconds")
+    parser.add_argument("--data", action="store_true", help="Real VLESS end-to-end probe (HTTP through the proxy, measures TTFB)")
+    parser.add_argument("--ed", action="store_true", help="With --data: use WS early data (0-RTT VLESS request)")
+    parser.add_argument("--uuid", default="", help="VLESS UUID for --data (default: V2RAY_UUID env or .v2ray_uuid)")
     args = parser.parse_args()
+
+    if args.data:
+        run_data_benchmark(args.domain, args.uuid, args.bug_host, args.port, args.path, args.probes, args.ed)
+        return
 
     run_benchmark(args.domain, args.bug_host, args.port, args.path, args.probes, args.hold, args.concurrency)
 

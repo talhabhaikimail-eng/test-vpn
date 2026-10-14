@@ -8,3 +8,4 @@ proxy_v2ray_bin
 __pycache__/
 *.key
 *.pem
+.v2ray_uuid

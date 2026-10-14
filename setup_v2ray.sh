@@ -52,6 +52,18 @@ sudo tee /etc/v2ray/config.json > /dev/null <<EOF
   "log": {
     "loglevel": "warning"
   },
+  "dns": {
+    "servers": ["localhost"],
+    "queryStrategy": "UseIPv4"
+  },
+  "policy": {
+    "levels": {
+      "0": {
+        "handshake": 4,
+        "connIdle": 300
+      }
+    }
+  },
   "inbounds": [
     {
       "tag": "vless-in",
@@ -70,7 +82,9 @@ sudo tee /etc/v2ray/config.json > /dev/null <<EOF
       "streamSettings": {
         "network": "ws",
         "wsSettings": {
-          "path": "/"
+          "path": "/",
+          "maxEarlyData": 2048,
+          "earlyDataHeaderName": "Sec-WebSocket-Protocol"
         }
       }
     },
@@ -90,7 +104,9 @@ sudo tee /etc/v2ray/config.json > /dev/null <<EOF
       "streamSettings": {
         "network": "ws",
         "wsSettings": {
-          "path": "/"
+          "path": "/",
+          "maxEarlyData": 2048,
+          "earlyDataHeaderName": "Sec-WebSocket-Protocol"
         }
       }
     }
@@ -100,7 +116,12 @@ sudo tee /etc/v2ray/config.json > /dev/null <<EOF
       "tag": "direct",
       "protocol": "freedom",
       "settings": {
-        "domainStrategy": "UseIP"
+        "domainStrategy": "UseIPv4"
+      },
+      "streamSettings": {
+        "sockopt": {
+          "tcpFastOpen": true
+        }
       }
     },
     {

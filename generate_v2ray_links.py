@@ -50,7 +50,7 @@ def get_domain():
                 return line
     return "YOUR_DOMAIN"
 
-def generate_vless_link(uuid, domain, path="/vless", name="V2Ray-VLESS-Cloudflare"):
+def generate_vless_link(uuid, domain, path="/vless", name="V2Ray-VLESS-Cloudflare", address=None):
     # vless://UUID@DOMAIN:443?encryption=none&security=tls&sni=DOMAIN&type=ws&host=DOMAIN&path=%2Fvless#NAME
     params = {
         "encryption": "none",
@@ -61,15 +61,15 @@ def generate_vless_link(uuid, domain, path="/vless", name="V2Ray-VLESS-Cloudflar
         "path": path,
     }
     query_str = urllib.parse.urlencode(params)
-    link = f"vless://{uuid}@{domain}:443?{query_str}#{urllib.parse.quote(name)}"
+    link = f"vless://{uuid}@{address or domain}:443?{query_str}#{urllib.parse.quote(name)}"
     return link
 
-def generate_vmess_link(uuid, domain, path="/vmess", name="V2Ray-VMess-Cloudflare"):
+def generate_vmess_link(uuid, domain, path="/vmess", name="V2Ray-VMess-Cloudflare", address=None):
     # VMess standard JSON format base64 encoded
     config = {
         "v": "2",
         "ps": name,
-        "add": domain,
+        "add": address or domain,
         "port": "443",
         "id": uuid,
         "aid": "0",
@@ -94,8 +94,15 @@ def main():
         print("[!] No UUID provided. Please provide UUID or set V2RAY_UUID environment variable.")
         return
 
-    vless_link = generate_vless_link(uuid, domain, path="/vless", name=f"VLESS-{domain}")
-    vmess_link = generate_vmess_link(uuid, domain, path="/vmess", name=f"VMess-{domain}")
+    # ?ed=2048: Xray-based clients (v2rayNG, v2rayN, NekoBox) put the first request in the WS
+    # upgrade (early data), saving one round trip per new connection. Older clients ignore it.
+    vless_link = generate_vless_link(uuid, domain, path="/vless?ed=2048", name=f"VLESS-{domain}")
+    vmess_link = generate_vmess_link(uuid, domain, path="/vmess?ed=2048", name=f"VMess-{domain}")
+
+    # Bug-host variants: client dials the carrier bug host (Cloudflare IP), SNI/Host stay on our domain
+    bug_host = os.environ.get("BUG_HOST", "jsbl.com").strip()
+    bug_vless = generate_vless_link(uuid, domain, path="/vless?ed=2048", name=f"VLESS-{bug_host}", address=bug_host) if bug_host else ""
+    bug_vmess = generate_vmess_link(uuid, domain, path="/vmess?ed=2048", name=f"VMess-{bug_host}", address=bug_host) if bug_host else ""
 
     print("=" * 70)
     print(" V2RAY WS + TLS CONFIGURATION (CLOUDFLARE TUNNEL)")
@@ -103,14 +110,19 @@ def main():
     print(f"Domain / Hostname : {domain}")
     print(f"Cloudflare Port   : 443 (HTTPS / WSS with TLS)")
     print(f"Local Reverse Port: 8080 (Cloudflare dashboard maps to localhost:8080)")
-    print(f"VLESS Path        : /vless (or /)")
-    print(f"VMess Path        : /vmess")
+    print(f"VLESS Path        : /vless?ed=2048 (or /vless, /)")
+    print(f"VMess Path        : /vmess?ed=2048 (or /vmess)")
     print("-" * 70)
     print(">>> VLESS Link (v2rayNG / Clash Meta / Sing-box / Shadowrocket):")
     print(vless_link)
     print("-" * 70)
     print(">>> VMess Link (v2rayNG / V2RayN / NetMod / NapsternetV):")
     print(vmess_link)
+    if bug_host:
+        print("-" * 70)
+        print(f">>> Via Bug Host {bug_host} (address={bug_host}, SNI/Host={domain}):")
+        print(bug_vless)
+        print(bug_vmess)
     print("=" * 70)
 
     # Output to GitHub step summary if running in GitHub Actions
@@ -121,8 +133,8 @@ def main():
             f.write(f"- **Domain / SNI**: `{domain}`\n")
             f.write(f"- **Port**: `443` (TLS enabled)\n")
             f.write(f"- **Cloudflared Reverse Proxy Target**: `localhost:8080`\n")
-            f.write(f"- **VLESS Path**: `/vless` (or `/`)\n")
-            f.write(f"- **VMess Path**: `/vmess`\n\n")
+            f.write(f"- **VLESS Path**: `/vless?ed=2048` (early data; `/vless` also works)\n")
+            f.write(f"- **VMess Path**: `/vmess?ed=2048` (early data; `/vmess` also works)\n\n")
             f.write("#### 🔗 Client Import Links:\n")
             f.write("```text\n")
             f.write(f"# VLESS WS + TLS\n{vless_link}\n\n")
