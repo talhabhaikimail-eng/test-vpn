@@ -159,7 +159,7 @@ jobs:
             # Auto-heal V2Ray Core if killed
             if ! pgrep -f "v2ray run" > /dev/null; then
               echo "[WATCHDOG] V2Ray Core died! Restarting..."
-              sudo nohup /usr/local/bin/v2ray run -c /etc/v2ray/config.json -format jsonv4 > /var/log/v2ray.log 2>&1 &
+              sudo nohup /usr/local/bin/v2ray run -c /etc/v2ray/config.json -format json > /var/log/v2ray.log 2>&1 &
             fi
 
             # Auto-heal Proxy Bridge if killed

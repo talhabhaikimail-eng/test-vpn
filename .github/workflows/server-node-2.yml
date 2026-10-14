@@ -251,7 +251,7 @@ jobs:
 
             if ! pgrep -f "v2ray run" > /dev/null; then
               echo "[WATCHDOG] Local V2Ray Core died! Restarting..."
-              sudo nohup /usr/local/bin/v2ray run -c /etc/v2ray/config.json -format jsonv4 > /var/log/v2ray.log 2>&1 &
+              sudo nohup /usr/local/bin/v2ray run -c /etc/v2ray/config.json -format json > /var/log/v2ray.log 2>&1 &
             fi
 
             if ! pgrep -f "proxy_v2ray_bin" > /dev/null; then

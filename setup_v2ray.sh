@@ -126,7 +126,7 @@ fi
 # 6. Start V2Ray Core
 echo "[+] Starting V2Ray Core..."
 sudo pkill -f "v2ray run" 2>/dev/null || true
-sudo nohup /usr/local/bin/v2ray run -c /etc/v2ray/config.json -format jsonv4 > /var/log/v2ray.log 2>&1 &
+sudo nohup /usr/local/bin/v2ray run -c /etc/v2ray/config.json -format json > /var/log/v2ray.log 2>&1 &
 sleep 2
 
 # 7. Start proxy_v2ray_bin on 0.0.0.0:8080
@@ -141,6 +141,10 @@ sleep 2
 # 8. Check listening ports
 echo "[+] Active ports check:"
 sudo ss -tulpn | grep -E ':8080|:10085|:10086' || true
+if ! pgrep -f "v2ray run" > /dev/null; then
+  echo "[!] V2Ray failed to start! Log:"
+  sudo cat /var/log/v2ray.log 2>/dev/null || true
+fi
 
 echo "=========================================================="
 echo " V2Ray Core & Proxy Bridge successfully started!"
