@@ -125,14 +125,14 @@ jobs:
 
           # Xray inbounds disabled (empty): this node serves only /mux and /health.
           sudo nohup ./proxy_mux_bin --listen 0.0.0.0:80 --vless "" --vmess "" --xhttp "" \
-            --mux-key-file /etc/v2ray/mux.key --name "Mux Node 2" > /var/log/proxy_mux.log 2>&1 &
+            --mux-key-file /etc/v2ray/mux.key --name "Mux Node 2" > proxy_mux.log 2>&1 &
 
           for _ in $(seq 1 10); do
             curl -fsS -m 3 http://127.0.0.1:80/health && break
             sleep 1
           done
-          curl -fsS -m 3 http://127.0.0.1:80/health > /dev/null || { echo "mux node not healthy"; sudo tail -40 /var/log/proxy_mux.log; exit 1; }
-          grep -q "/mux session protocol enabled" /var/log/proxy_mux.log || { echo "mux not enabled (key missing?)"; sudo tail -40 /var/log/proxy_mux.log; exit 1; }
+          curl -fsS -m 3 http://127.0.0.1:80/health > /dev/null || { echo "mux node not healthy"; sudo tail -40 proxy_mux.log; exit 1; }
+          grep -q "/mux session protocol enabled" proxy_mux.log || { echo "mux not enabled (key missing?)"; sudo tail -40 proxy_mux.log; exit 1; }
           echo "Mux Node 2 healthy on :80"
 
       # ── Cloudflare Tunnel ───────────────────────────────────────────────────
@@ -194,7 +194,7 @@ jobs:
           start_proxy() {
             sudo pkill -f "proxy_mux_bin" 2>/dev/null || true
             sudo nohup ./proxy_mux_bin --listen 0.0.0.0:80 --vless "" --vmess "" --xhttp "" \
-              --mux-key-file /etc/v2ray/mux.key --name "Mux Node 2" > /var/log/proxy_mux.log 2>&1 &
+              --mux-key-file /etc/v2ray/mux.key --name "Mux Node 2" > proxy_mux.log 2>&1 &
           }
 
           echo "Mux Node 2 running for $TARGET_DURATION minutes ($TOTAL_SECONDS s)."
