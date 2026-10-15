@@ -17,7 +17,6 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -29,16 +28,19 @@ import (
 )
 
 const (
-	muxIdleTimeout   = 150 * time.Second // no frame for this long -> drop the session
 	muxDialTimeout   = 10 * time.Second
 	muxDNSTimeout    = 2 * time.Second
 	muxDNSCacheTTL   = 60 * time.Second
 	muxDNSCacheLimit = 4096
+	muxResumeGrace   = 90 * time.Second // keep a dropped session resumable this long
 )
 
 var muxDNSUpstreams = []string{"1.1.1.1:53", "8.8.8.8:53", "1.0.0.1:53"}
 
-var muxSessions atomic.Int64
+var (
+	muxSessions atomic.Int64
+	muxReg      = newMuxResumeRegistry()
+)
 
 func muxAcceptKey(key string) string {
 	h := sha1.New()
@@ -182,39 +184,17 @@ func (rt *router) serveMux(w http.ResponseWriter, r *http.Request) {
 		conn = &muxPrefixConn{Conn: client, r: brw.Reader}
 	}
 
-	_ = conn.SetReadDeadline(time.Now().Add(handshakeTimeout))
-	sess, err := muxServerHandshake(conn, rt.muxKey)
-	if err != nil {
-		log.Printf("mux handshake from %s: %v", r.RemoteAddr, err)
-		return
-	}
-	_ = conn.SetReadDeadline(time.Time{})
-
-	sess.onOpen = func(st *muxStream, host string, port int, initial []byte) {
-		muxServeStream(st, host, port, initial, muxDialer)
-	}
-	sess.onDNS = muxResolveDNS
-
 	n := muxSessions.Add(1)
-	log.Printf("mux session up (%d active) from %s", n, r.RemoteAddr)
-	defer func() { log.Printf("mux session down (%d active)", muxSessions.Add(-1)) }()
+	log.Printf("mux connection up (%d active) from %s", n, r.RemoteAddr)
+	defer func() { log.Printf("mux connection down (%d active)", muxSessions.Add(-1)) }()
 
-	// Idle watchdog: the client pings every ~15 s; a silent socket is dead.
-	go func() {
-		t := time.NewTicker(30 * time.Second)
-		defer t.Stop()
-		for {
-			select {
-			case <-sess.done:
-				return
-			case <-t.C:
-				if time.Since(sess.LastRecv()) > muxIdleTimeout {
-					_ = sess.closeWith(fmt.Errorf("mux: idle for %s", muxIdleTimeout))
-					return
-				}
-			}
+	// muxServerConn handshakes, decides fresh-vs-resume, serves, and on a link
+	// drop keeps the session resumable for muxResumeGrace so the client can
+	// reattach its open streams.
+	muxServerConn(conn, rt.muxKey, muxReg, muxResumeGrace, func(sess *muxSession) {
+		sess.onOpen = func(st *muxStream, host string, port int, initial []byte) {
+			muxServeStream(st, host, port, initial, muxDialer)
 		}
-	}()
-
-	_ = sess.Serve()
+		sess.onDNS = muxResolveDNS
+	}, func(msg string) { log.Printf("%s from %s", msg, r.RemoteAddr) })
 }

@@ -1,37 +1,39 @@
 package main
 
-// muxproto: a small multiplexed, encrypted stream protocol carried over one
-// long-lived "WebSocket" (raw bytes after the 101) through a Cloudflare bug host.
+// muxproto: a small multiplexed, encrypted, *resumable* stream protocol carried
+// over one long-lived "WebSocket" (raw bytes after the 101) through a Cloudflare
+// bug host.
 //
-// This file is shared verbatim between the Windows client (package tunnel) and
-// the GitHub Actions node (package main, muxproto.go); only the package line
-// differs. It uses the standard library only so the node can keep building
-// single-file binaries without a go.mod.
+// This file is shared verbatim between the Windows/Android client (package
+// tunnel) and the GitHub Actions node (package main, muxproto.go); only the
+// package line differs. It uses the standard library only so the node can keep
+// building single-file binaries without a go.mod.
 //
 // Wire format
 //
-//	prelude  (client -> server, plaintext): "MUX1" + 16-byte salt
+//	prelude  (client -> server, plaintext): "MUX2" + 16-byte salt
 //	record   : [len uint16 BE][AES-256-GCM(frame)]   len = ciphertext length incl. tag
 //	frame    : [type uint8][stream uint32 BE][payload]
 //
-// Keys: sha256(psk | salt | "c2s") and sha256(psk | salt | "s2c"); nonce is a
-// per-direction 64-bit counter, so a key is never reused across sessions.
+// Keys: sha256(psk | salt | "c2s") and sha256(psk | salt | "s2c"); the nonce is
+// a per-direction 64-bit counter, so a key is never reused on a link. Every
+// reconnect uses a fresh salt, hence fresh keys, so replayed frames are
+// re-encrypted under new keys and nonces are never reused across links either.
 //
-// Frames
+// Resumption
 //
-//	OPEN   client->server  payload = port(2) hostLen(1) host [initial data]
-//	DATA   both           payload = bytes
-//	FIN    both           half-close: no more DATA from the sender
-//	RST    both           abort the stream
-//	WINDOW both           payload = uint32 bytes the receiver consumed (flow credit)
-//	PING   both           payload = 8 bytes (sender timestamp); peer echoes as PONG
-//	PONG   both
-//	DNS    client->server payload = raw DNS message; stream id = query id
-//	DNSR   server->client payload = raw DNS reply;   stream id = query id
+//	Each endpoint numbers its own outgoing *reliable* frames (OPEN/DATA/FIN/RST/
+//	WINDOW) 1,2,3,... and keeps them in a replay buffer until the peer confirms
+//	receipt (ACK frames carry the peer's count of reliable frames received).
+//	When the link dies the session is not torn down: streams block, the client
+//	redials the bug host and sends RESUME(sessionID, framesReceived); the server
+//	adopts the existing session, both sides retransmit the reliable frames the
+//	peer is missing, and streams continue exactly where they stopped. This is
+//	what lets open connections survive a carrier NAT drop or the node's 6-hour
+//	hand-off.
 //
-// A stream is opened without waiting for a confirmation: the first DATA frames
+// A stream opens without waiting for a confirmation: the first DATA frames
 // follow OPEN immediately, so a new TCP connection costs no extra round trip.
-// The server answers with RST if the target cannot be reached.
 
 import (
 	"bufio"
@@ -39,6 +41,7 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -51,29 +54,45 @@ import (
 )
 
 const (
-	muxMagic       = "MUX1"
-	muxSaltLen     = 16
-	muxFrameHdr    = 5
-	muxMaxPayload  = 32 * 1024
-	muxMaxRecord   = muxFrameHdr + muxMaxPayload + 16
+	muxMagic      = "MUX2"
+	muxSaltLen    = 16
+	muxSessIDLen  = 16
+	muxFrameHdr   = 5
+	muxMaxPayload = 32 * 1024
+	muxMaxRecord  = muxFrameHdr + muxMaxPayload + 16
+
 	muxWindow      = 4 << 20 // per-stream receive window (bytes)
 	muxWindowDelta = muxWindow / 4
+	muxReplayCap   = 8 << 20 // max buffered unacked reliable bytes before Write() blocks
+	muxAckEvery    = 64      // send an ACK after this many reliable frames received
 
+	// Reliable frames (numbered, buffered for replay, acknowledged).
 	muxOpen     = 0x01
 	muxData     = 0x02
 	muxFin      = 0x03
 	muxRst      = 0x04
 	muxWindowUp = 0x05
-	muxPing     = 0x06
-	muxPong     = 0x07
-	muxDNS      = 0x08
-	muxDNSReply = 0x09
+	// Unreliable frames (link-local, never replayed).
+	muxPing       = 0x06
+	muxPong       = 0x07
+	muxDNS        = 0x08
+	muxDNSReply   = 0x09
+	muxAck        = 0x0a
+	muxHello      = 0x0b
+	muxResume     = 0x0c
+	muxResumeOK   = 0x0d
+	muxResumeFail = 0x0e
 )
+
+func muxReliable(typ byte) bool {
+	return typ >= muxOpen && typ <= muxWindowUp
+}
 
 var (
 	errMuxClosed   = errors.New("mux: session closed")
 	errMuxReset    = errors.New("mux: stream reset by peer")
 	errMuxBadMagic = errors.New("mux: bad prelude")
+	errMuxResume   = errors.New("mux: resume rejected")
 	errMuxTimeout  = &muxTimeoutError{}
 )
 
@@ -122,9 +141,9 @@ type muxLink struct {
 	dec  *muxCipher
 
 	wmu  sync.Mutex
-	wbuf []byte // 2 + muxMaxRecord
-	rbuf []byte // muxMaxRecord
-	pbuf []byte // decrypted frame
+	wbuf []byte
+	rbuf []byte
+	pbuf []byte
 }
 
 func newMuxLink(conn net.Conn, psk, salt []byte, isClient bool) (*muxLink, error) {
@@ -151,19 +170,18 @@ func newMuxLink(conn net.Conn, psk, salt []byte, isClient bool) (*muxLink, error
 	}, nil
 }
 
-// writeFrame encrypts one frame and writes it as a single record.
+// writeFrame encrypts one frame and writes it as a single record. Safe for one
+// writer at a time; the session serializes all writes under its own lock.
 func (l *muxLink) writeFrame(typ byte, id uint32, payload []byte) error {
 	if len(payload) > muxMaxPayload {
 		return fmt.Errorf("mux: payload %d exceeds max %d", len(payload), muxMaxPayload)
 	}
 	l.wmu.Lock()
 	defer l.wmu.Unlock()
-
 	plain := l.pbuf[:muxFrameHdr+len(payload)]
 	plain[0] = typ
 	binary.BigEndian.PutUint32(plain[1:5], id)
 	copy(plain[5:], payload)
-
 	ctLen := len(plain) + l.enc.aead.Overhead()
 	binary.BigEndian.PutUint16(l.wbuf[:2], uint16(ctLen))
 	l.enc.aead.Seal(l.wbuf[2:2], l.enc.next(), plain, l.wbuf[:2])
@@ -171,8 +189,8 @@ func (l *muxLink) writeFrame(typ byte, id uint32, payload []byte) error {
 	return err
 }
 
-// readFrame reads and decrypts one record. The payload slice is only valid
-// until the next call.
+// readFrame reads and decrypts one record. The payload slice is valid only
+// until the next call on this link.
 func (l *muxLink) readFrame() (typ byte, id uint32, payload []byte, err error) {
 	var hdr [2]byte
 	if _, err = io.ReadFull(l.r, hdr[:]); err != nil {
@@ -197,18 +215,36 @@ func (l *muxLink) readFrame() (typ byte, id uint32, payload []byte, err error) {
 	return
 }
 
+func (l *muxLink) close() { _ = l.conn.Close() }
+
 // ── session ──────────────────────────────────────────────────────────────────
 
-// muxOpenHandler is invoked on the server for every OPEN. It must not block the
-// read loop: the session calls it in its own goroutine.
 type muxOpenHandler func(s *muxStream, host string, port int, initial []byte)
-
-// muxDNSHandler answers a raw DNS query on the server.
 type muxDNSHandler func(query []byte) ([]byte, error)
 
+type muxReplayEntry struct {
+	idx     uint64
+	typ     byte
+	id      uint32
+	payload []byte
+}
+
 type muxSession struct {
-	link     *muxLink
-	isClient bool
+	isClient  bool
+	sessionID [muxSessIDLen]byte
+
+	// write side: link + reliable numbering + replay buffer, all under wmu.
+	wmu         sync.Mutex
+	linkCond    *sync.Cond
+	link        *muxLink // nil while detached
+	txSeq       uint64   // reliable frames assigned so far
+	peerAck     uint64   // reliable frames the peer has confirmed receiving
+	replay      []muxReplayEntry
+	replayBytes int
+
+	// read side (touched only by the active serveLink goroutine).
+	rxSeq       uint64
+	lastAckSent uint64
 
 	mu      sync.Mutex
 	streams map[uint32]*muxStream
@@ -226,20 +262,25 @@ type muxSession struct {
 	closeErr error
 	done     chan struct{}
 
-	lastRecv atomic.Int64 // unix nanos of the last frame read
+	lastRecv atomic.Int64
 	rttMs    atomic.Int64
 	pongCh   chan int64
+	helloCh  chan struct{}
+
+	reg *muxResumeRegistry // server only
 }
 
 func newMuxSession(link *muxLink, isClient bool) *muxSession {
 	s := &muxSession{
-		link:       link,
 		isClient:   isClient,
+		link:       link,
 		streams:    make(map[uint32]*muxStream),
 		dnsWaiters: make(map[uint32]chan []byte),
 		done:       make(chan struct{}),
 		pongCh:     make(chan int64, 4),
+		helloCh:    make(chan struct{}, 1),
 	}
+	s.linkCond = sync.NewCond(&s.wmu)
 	if isClient {
 		s.nextID = 1
 	} else {
@@ -249,46 +290,120 @@ func newMuxSession(link *muxLink, isClient bool) *muxSession {
 	return s
 }
 
-// muxClientHandshake writes the prelude and returns a client session.
-func muxClientHandshake(conn net.Conn, psk []byte) (*muxSession, error) {
-	salt := make([]byte, muxSaltLen)
-	if _, err := rand.Read(salt); err != nil {
-		return nil, err
+// send writes one frame. Reliable frames are numbered and buffered for replay;
+// if the link is momentarily down they queue and flush on resume (Write only
+// blocks once the replay buffer is full). Unreliable frames are dropped if the
+// link is down.
+func (s *muxSession) send(typ byte, id uint32, payload []byte) error {
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+	if s.closed.Load() {
+		return errMuxClosed
 	}
-	prelude := make([]byte, 0, 4+muxSaltLen)
-	prelude = append(prelude, muxMagic...)
-	prelude = append(prelude, salt...)
-	if _, err := conn.Write(prelude); err != nil {
-		return nil, err
+	if !muxReliable(typ) {
+		if s.link != nil {
+			_ = s.link.writeFrame(typ, id, payload)
+		}
+		return nil
 	}
-	link, err := newMuxLink(conn, psk, salt, true)
-	if err != nil {
-		return nil, err
+	// Reliable: apply replay-buffer backpressure.
+	for s.replayBytes+len(payload) > muxReplayCap && !s.closed.Load() {
+		s.linkCond.Wait()
 	}
-	return newMuxSession(link, true), nil
+	if s.closed.Load() {
+		return errMuxClosed
+	}
+	s.txSeq++
+	buf := append([]byte(nil), payload...)
+	s.replay = append(s.replay, muxReplayEntry{idx: s.txSeq, typ: typ, id: id, payload: buf})
+	s.replayBytes += len(buf)
+	if s.link != nil {
+		if err := s.link.writeFrame(typ, id, buf); err != nil {
+			// Link just died; the serveLink loop will notice and resume.
+			s.link = nil
+		}
+	}
+	return nil
 }
 
-// muxServerHandshake reads the prelude and returns a server session. The
-// caller must have already answered the HTTP 101.
-func muxServerHandshake(conn net.Conn, psk []byte) (*muxSession, error) {
-	var prelude [4 + muxSaltLen]byte
-	if _, err := io.ReadFull(conn, prelude[:]); err != nil {
-		return nil, err
-	}
-	if string(prelude[:4]) != muxMagic {
-		return nil, errMuxBadMagic
-	}
-	link, err := newMuxLink(conn, psk, prelude[4:], false)
-	if err != nil {
-		return nil, err
-	}
-	return newMuxSession(link, false), nil
+// sendRaw writes directly on a specific link, bypassing the session link state.
+// Used during the resume/hello handshake before the link is installed.
+func (s *muxSession) sendRaw(link *muxLink, typ byte, id uint32, payload []byte) error {
+	return link.writeFrame(typ, id, payload)
 }
 
-func (s *muxSession) Closed() bool { return s.closed.Load() }
+func (s *muxSession) trimReplay(ack uint64) {
+	s.wmu.Lock()
+	if ack > s.peerAck {
+		s.peerAck = ack
+		i := 0
+		for i < len(s.replay) && s.replay[i].idx <= ack {
+			s.replayBytes -= len(s.replay[i].payload)
+			i++
+		}
+		if i > 0 {
+			s.replay = append([]muxReplayEntry(nil), s.replay[i:]...)
+		}
+	}
+	s.wmu.Unlock()
+	s.linkCond.Broadcast()
+}
 
-func (s *muxSession) RTTms() int64 { return s.rttMs.Load() }
+// installLink swaps in a new link and retransmits the reliable frames the peer
+// (which has received peerRx reliable frames) is missing. Caller must not hold
+// wmu. Writers blocked in send() wake and continue after the backlog.
+func (s *muxSession) installLink(link *muxLink, peerRx uint64) {
+	s.wmu.Lock()
+	if peerRx > s.peerAck {
+		s.peerAck = peerRx
+	}
+	// Drop acknowledged entries, then replay the rest in order.
+	i := 0
+	for i < len(s.replay) && s.replay[i].idx <= s.peerAck {
+		s.replayBytes -= len(s.replay[i].payload)
+		i++
+	}
+	if i > 0 {
+		s.replay = append([]muxReplayEntry(nil), s.replay[i:]...)
+	}
+	s.link = link
+	backlog := make([]muxReplayEntry, len(s.replay))
+	copy(backlog, s.replay)
+	s.wmu.Unlock()
 
+	for _, e := range backlog {
+		if err := link.writeFrame(e.typ, e.id, e.payload); err != nil {
+			s.wmu.Lock()
+			if s.link == link {
+				s.link = nil
+			}
+			s.wmu.Unlock()
+			break
+		}
+	}
+	s.linkCond.Broadcast()
+}
+
+// dropLink forces the current link closed so the serveLink loop errors out and
+// the supervisor starts a resume. Used by the keepalive watchdog.
+func (s *muxSession) dropLink() {
+	s.wmu.Lock()
+	l := s.link
+	s.link = nil
+	s.wmu.Unlock()
+	if l != nil {
+		l.close()
+	}
+}
+
+func (s *muxSession) currentLink() *muxLink {
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+	return s.link
+}
+
+func (s *muxSession) Closed() bool        { return s.closed.Load() }
+func (s *muxSession) RTTms() int64        { return s.rttMs.Load() }
 func (s *muxSession) LastRecv() time.Time { return time.Unix(0, s.lastRecv.Load()) }
 
 func (s *muxSession) ActiveStreams() int {
@@ -297,7 +412,6 @@ func (s *muxSession) ActiveStreams() int {
 	return len(s.streams)
 }
 
-// Close tears the session down; every stream unblocks with err.
 func (s *muxSession) Close() error { return s.closeWith(errMuxClosed) }
 
 func (s *muxSession) closeWith(err error) error {
@@ -305,8 +419,15 @@ func (s *muxSession) closeWith(err error) error {
 		return nil
 	}
 	s.closeErr = err
-	_ = s.link.conn.Close()
+	s.wmu.Lock()
+	l := s.link
+	s.link = nil
+	s.wmu.Unlock()
+	if l != nil {
+		l.close()
+	}
 	close(s.done)
+	s.linkCond.Broadcast()
 
 	s.mu.Lock()
 	streams := make([]*muxStream, 0, len(s.streams))
@@ -326,6 +447,9 @@ func (s *muxSession) closeWith(err error) error {
 	}
 	s.dnsMu.Unlock()
 
+	if s.reg != nil {
+		s.reg.remove(s.sessionID)
+	}
 	if s.onClose != nil {
 		go s.onClose(err)
 	}
@@ -337,7 +461,6 @@ func (s *muxSession) Ping(timeout time.Duration) (time.Duration, error) {
 	var payload [8]byte
 	t0 := time.Now()
 	binary.BigEndian.PutUint64(payload[:], uint64(t0.UnixNano()))
-	// Drain any stale pongs.
 	for {
 		select {
 		case <-s.pongCh:
@@ -346,7 +469,7 @@ func (s *muxSession) Ping(timeout time.Duration) (time.Duration, error) {
 		}
 		break
 	}
-	if err := s.link.writeFrame(muxPing, 0, payload[:]); err != nil {
+	if err := s.send(muxPing, 0, payload[:]); err != nil {
 		return 0, err
 	}
 	timer := time.NewTimer(timeout)
@@ -382,9 +505,6 @@ func (s *muxSession) OpenStream(host string, port int, initial []byte) (*muxStre
 	payload = append(payload, byte(len(host)))
 	payload = append(payload, host...)
 	room := muxMaxPayload - len(payload)
-	if room < 0 {
-		room = 0
-	}
 	first := initial
 	if len(first) > room {
 		first = initial[:room]
@@ -398,7 +518,7 @@ func (s *muxSession) OpenStream(host string, port int, initial []byte) (*muxStre
 	s.streams[id] = st
 	s.mu.Unlock()
 
-	if err := s.link.writeFrame(muxOpen, id, payload); err != nil {
+	if err := s.send(muxOpen, id, payload); err != nil {
 		s.removeStream(id)
 		return nil, err
 	}
@@ -410,7 +530,9 @@ func (s *muxSession) OpenStream(host string, port int, initial []byte) (*muxStre
 	return st, nil
 }
 
-// QueryDNS sends one raw DNS message and waits for the reply.
+// QueryDNS sends one raw DNS message and waits for the reply. DNS is
+// best-effort: a query in flight during a link drop simply times out and the
+// caller retries.
 func (s *muxSession) QueryDNS(query []byte, timeout time.Duration) ([]byte, error) {
 	if s.closed.Load() {
 		return nil, errMuxClosed
@@ -430,7 +552,7 @@ func (s *muxSession) QueryDNS(query []byte, timeout time.Duration) ([]byte, erro
 		delete(s.dnsWaiters, id)
 		s.dnsMu.Unlock()
 	}
-	if err := s.link.writeFrame(muxDNS, id, query); err != nil {
+	if err := s.send(muxDNS, id, query); err != nil {
 		cleanup()
 		return nil, err
 	}
@@ -463,35 +585,44 @@ func (s *muxSession) getStream(id uint32) *muxStream {
 	return st
 }
 
-// Serve runs the read loop until the link fails. It always returns a non-nil
-// error and closes the session.
-func (s *muxSession) Serve() error {
+// serveLink runs the read loop on one link until it fails; it returns the read
+// error (never nil). It does not close the session, so the caller can resume.
+func (s *muxSession) serveLink(link *muxLink) error {
 	for {
-		typ, id, payload, err := s.link.readFrame()
+		typ, id, payload, err := link.readFrame()
 		if err != nil {
-			s.closeWith(err)
 			return err
 		}
 		s.lastRecv.Store(time.Now().UnixNano())
 
+		if muxReliable(typ) {
+			s.rxSeq++
+			if s.rxSeq-s.lastAckSent >= muxAckEvery {
+				s.sendAck(link)
+			}
+		}
+
 		switch typ {
 		case muxOpen:
 			if s.isClient || s.onOpen == nil {
-				_ = s.link.writeFrame(muxRst, id, nil)
+				_ = s.send(muxRst, id, nil)
 				continue
 			}
 			if len(payload) < 3 {
-				_ = s.link.writeFrame(muxRst, id, nil)
+				_ = s.send(muxRst, id, nil)
 				continue
 			}
 			port := int(binary.BigEndian.Uint16(payload[:2]))
 			hl := int(payload[2])
 			if len(payload) < 3+hl {
-				_ = s.link.writeFrame(muxRst, id, nil)
+				_ = s.send(muxRst, id, nil)
 				continue
 			}
 			host := string(payload[3 : 3+hl])
 			initial := append([]byte(nil), payload[3+hl:]...)
+			if s.getStream(id) != nil {
+				continue // duplicate OPEN after resume
+			}
 			st := newMuxStream(s, id)
 			s.mu.Lock()
 			s.streams[id] = st
@@ -521,16 +652,29 @@ func (s *muxSession) Serve() error {
 				}
 			}
 
+		case muxAck:
+			if len(payload) >= 8 {
+				s.trimReplay(binary.BigEndian.Uint64(payload[:8]))
+			}
+
 		case muxPing:
-			_ = s.link.writeFrame(muxPong, id, payload)
+			_ = s.send(muxPong, id, payload)
 
 		case muxPong:
 			if len(payload) >= 8 {
-				ts := int64(binary.BigEndian.Uint64(payload[:8]))
 				select {
-				case s.pongCh <- ts:
+				case s.pongCh <- int64(binary.BigEndian.Uint64(payload[:8])):
 				default:
 				}
+			}
+
+		case muxHello:
+			if len(payload) >= muxSessIDLen {
+				copy(s.sessionID[:], payload[:muxSessIDLen])
+			}
+			select {
+			case s.helloCh <- struct{}{}:
+			default:
 			}
 
 		case muxDNS:
@@ -543,7 +687,7 @@ func (s *muxSession) Serve() error {
 				if err != nil || len(resp) == 0 || len(resp) > muxMaxPayload {
 					return
 				}
-				_ = s.link.writeFrame(muxDNSReply, id, resp)
+				_ = s.send(muxDNSReply, id, resp)
 			}(id, q)
 
 		case muxDNSReply:
@@ -558,6 +702,261 @@ func (s *muxSession) Serve() error {
 	}
 }
 
+func (s *muxSession) sendAck(link *muxLink) {
+	var p [8]byte
+	binary.BigEndian.PutUint64(p[:], s.rxSeq)
+	if err := link.writeFrame(muxAck, 0, p[:]); err == nil {
+		s.lastAckSent = s.rxSeq
+	}
+}
+
+// ── client handshake / hello / resume ────────────────────────────────────────
+
+// muxClientHandshake writes the plaintext prelude and installs the link.
+func muxClientHandshake(conn net.Conn, psk []byte) (*muxSession, error) {
+	link, err := muxWritePrelude(conn, psk, true)
+	if err != nil {
+		return nil, err
+	}
+	return newMuxSession(link, true), nil
+}
+
+func muxWritePrelude(conn net.Conn, psk []byte, isClient bool) (*muxLink, error) {
+	salt := make([]byte, muxSaltLen)
+	if _, err := rand.Read(salt); err != nil {
+		return nil, err
+	}
+	prelude := make([]byte, 0, 4+muxSaltLen)
+	prelude = append(prelude, muxMagic...)
+	prelude = append(prelude, salt...)
+	if _, err := conn.Write(prelude); err != nil {
+		return nil, err
+	}
+	return newMuxLink(conn, psk, salt, isClient)
+}
+
+// clientHello sends HELLO (to learn the sessionID) plus a PING, and waits for
+// the PONG that proves the server holds the same key. The HELLO reply carrying
+// the sessionID arrives asynchronously and is stored by serveLink.
+func (s *muxSession) clientHello(link *muxLink, timeout time.Duration) (time.Duration, error) {
+	if err := s.sendRaw(link, muxHello, 0, nil); err != nil {
+		return 0, err
+	}
+	var payload [8]byte
+	t0 := time.Now()
+	binary.BigEndian.PutUint64(payload[:], uint64(t0.UnixNano()))
+	if err := s.sendRaw(link, muxPing, 0, payload[:]); err != nil {
+		return 0, err
+	}
+	_ = link.conn.SetReadDeadline(time.Now().Add(timeout))
+	defer link.conn.SetReadDeadline(time.Time{})
+	for {
+		typ, _, pl, err := link.readFrame()
+		if err != nil {
+			return 0, err
+		}
+		s.lastRecv.Store(time.Now().UnixNano())
+		switch typ {
+		case muxHello:
+			if len(pl) >= muxSessIDLen {
+				copy(s.sessionID[:], pl[:muxSessIDLen])
+			}
+		case muxPong:
+			rtt := time.Since(t0)
+			s.rttMs.Store(rtt.Milliseconds())
+			return rtt, nil
+		}
+	}
+}
+
+// clientResume opens a fresh link over conn and reattaches this session on the
+// server. On success the session's link is swapped and the backlog retransmitted.
+func (s *muxSession) clientResume(conn net.Conn, psk []byte, timeout time.Duration) error {
+	link, err := muxWritePrelude(conn, psk, true)
+	if err != nil {
+		return err
+	}
+	payload := make([]byte, muxSessIDLen+8)
+	copy(payload, s.sessionID[:])
+	binary.BigEndian.PutUint64(payload[muxSessIDLen:], s.rxSeq)
+	if err := s.sendRaw(link, muxResume, 0, payload); err != nil {
+		return err
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(timeout))
+	typ, _, pl, err := link.readFrame()
+	_ = conn.SetReadDeadline(time.Time{})
+	if err != nil {
+		return err
+	}
+	if typ != muxResumeOK || len(pl) < 8 {
+		return errMuxResume
+	}
+	peerRx := binary.BigEndian.Uint64(pl[:8])
+	s.lastRecv.Store(time.Now().UnixNano())
+	s.installLink(link, peerRx)
+	return nil
+}
+
+// ── server handshake / accept ────────────────────────────────────────────────
+
+// muxResumeRegistry holds detached server sessions awaiting resume.
+type muxResumeRegistry struct {
+	mu    sync.Mutex
+	items map[[muxSessIDLen]byte]*muxSession
+}
+
+func newMuxResumeRegistry() *muxResumeRegistry {
+	return &muxResumeRegistry{items: make(map[[muxSessIDLen]byte]*muxSession)}
+}
+
+func (r *muxResumeRegistry) put(s *muxSession) {
+	r.mu.Lock()
+	r.items[s.sessionID] = s
+	r.mu.Unlock()
+}
+
+func (r *muxResumeRegistry) take(id [muxSessIDLen]byte) *muxSession {
+	r.mu.Lock()
+	s := r.items[id]
+	delete(r.items, id)
+	r.mu.Unlock()
+	return s
+}
+
+func (r *muxResumeRegistry) remove(id [muxSessIDLen]byte) {
+	r.mu.Lock()
+	delete(r.items, id)
+	r.mu.Unlock()
+}
+
+// muxServerConn drives one incoming /mux connection: handshake, decide fresh vs
+// resume, serve, and on link-down keep the session alive for the grace period
+// so the client can reattach. setup is called once per fresh session to install
+// its handlers. It blocks until the connection ends.
+func muxServerConn(conn net.Conn, psk []byte, reg *muxResumeRegistry, grace time.Duration, setup func(*muxSession), log func(string)) {
+	link, err := muxReadPrelude(conn, psk)
+	if err != nil {
+		return
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(15 * time.Second))
+	typ, _, pl, err := link.readFrame()
+	_ = conn.SetReadDeadline(time.Time{})
+	if err != nil {
+		return
+	}
+
+	switch typ {
+	case muxResume:
+		if len(pl) < muxSessIDLen+8 {
+			return
+		}
+		var id [muxSessIDLen]byte
+		copy(id[:], pl[:muxSessIDLen])
+		peerRx := binary.BigEndian.Uint64(pl[muxSessIDLen : muxSessIDLen+8])
+		sess := reg.take(id)
+		if sess == nil || sess.Closed() {
+			_ = link.writeFrame(muxResumeFail, 0, nil)
+			return
+		}
+		var ack [8]byte
+		binary.BigEndian.PutUint64(ack[:], sess.rxSeq)
+		if err := link.writeFrame(muxResumeOK, 0, ack[:]); err != nil {
+			reg.put(sess) // put it back; another attempt may succeed
+			return
+		}
+		sess.installLink(link, peerRx)
+		if log != nil {
+			log("mux: session resumed")
+		}
+		serr := sess.serveWithIdle(link, muxServerIdle)
+		muxServerAfterServe(sess, reg, grace)
+		_ = serr
+
+	case muxHello:
+		sess := newMuxSession(link, false)
+		if _, err := rand.Read(sess.sessionID[:]); err != nil {
+			return
+		}
+		sess.reg = reg
+		if setup != nil {
+			setup(sess)
+		}
+		reg.put(sess)
+		// Reply HELLO (sessionID) and, if the client folded in a PING, it will
+		// be answered by serveLink.
+		_ = link.writeFrame(muxHello, 0, sess.sessionID[:])
+		serr := sess.serveWithIdle(link, muxServerIdle)
+		muxServerAfterServe(sess, reg, grace)
+		_ = serr
+
+	default:
+		return
+	}
+}
+
+// muxServeWithIdle runs serveLink while a watchdog drops the link if no frame
+// arrives for idle (clients ping well within that window). Returns serveLink's error.
+func (s *muxSession) serveWithIdle(link *muxLink, idle time.Duration) error {
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		t := time.NewTicker(idle / 3)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-s.done:
+				return
+			case <-t.C:
+				if time.Since(s.LastRecv()) > idle {
+					s.dropLink()
+					return
+				}
+			}
+		}
+	}()
+	return s.serveLink(link)
+}
+
+// muxServerIdle drops an attached server link after this much silence.
+const muxServerIdle = 150 * time.Second
+
+// muxServerAfterServe decides what to do when a server link drops: if the
+// session is still open, hold it in the registry for the grace period so the
+// client can resume; otherwise it is already gone.
+func muxServerAfterServe(sess *muxSession, reg *muxResumeRegistry, grace time.Duration) {
+	if sess.Closed() {
+		return
+	}
+	sess.wmu.Lock()
+	sess.link = nil
+	sess.wmu.Unlock()
+	reg.put(sess)
+	// Grace timer: if nobody resumes within the window, close it. If a resume
+	// adopts it first, take() removes it from the registry and serveLink runs
+	// again, so this timer closing a since-readopted session is prevented by
+	// checking that it is still the registry's entry.
+	time.AfterFunc(grace, func() {
+		if s := reg.take(sess.sessionID); s == sess {
+			_ = s.closeWith(fmt.Errorf("mux: resume grace expired"))
+		} else if s != nil {
+			reg.put(s) // not ours; put the current one back
+		}
+	})
+}
+
+func muxReadPrelude(conn net.Conn, psk []byte) (*muxLink, error) {
+	var prelude [4 + muxSaltLen]byte
+	if _, err := io.ReadFull(conn, prelude[:]); err != nil {
+		return nil, err
+	}
+	if subtle.ConstantTimeCompare([]byte(muxMagic), prelude[:4]) != 1 {
+		return nil, errMuxBadMagic
+	}
+	return newMuxLink(conn, psk, prelude[4:], false)
+}
+
 // ── stream: net.Conn over the session ────────────────────────────────────────
 
 type muxStream struct {
@@ -567,14 +966,14 @@ type muxStream struct {
 	mu   sync.Mutex
 	cond *sync.Cond
 
-	recv     [][]byte // queued chunks
-	recvHead int      // offset into recv[0]
-	unacked  int64    // bytes consumed but not yet credited back
+	recv     [][]byte
+	recvHead int
+	unacked  int64
 	finRecv  bool
 	finSent  bool
-	err      error // set on abort/reset
+	err      error
 
-	credit int64 // bytes we may still send
+	credit int64
 
 	readDeadline  time.Time
 	writeDeadline time.Time
@@ -621,8 +1020,6 @@ func (st *muxStream) abort(err error) {
 	st.cond.Broadcast()
 }
 
-// waitLocked blocks on the condition until the deadline passes. The caller
-// holds st.mu. Returns false if the deadline expired.
 func (st *muxStream) waitLocked(deadline time.Time) bool {
 	if deadline.IsZero() {
 		st.cond.Wait()
@@ -659,7 +1056,7 @@ func (st *muxStream) Read(b []byte) (int, error) {
 			if credit > 0 {
 				var p [4]byte
 				binary.BigEndian.PutUint32(p[:], uint32(credit))
-				_ = st.sess.link.writeFrame(muxWindowUp, st.id, p[:])
+				_ = st.sess.send(muxWindowUp, st.id, p[:])
 			}
 			return n, nil
 		}
@@ -708,7 +1105,7 @@ func (st *muxStream) Write(b []byte) (int, error) {
 		st.credit -= int64(n)
 		st.mu.Unlock()
 
-		if err := st.sess.link.writeFrame(muxData, st.id, b[:n]); err != nil {
+		if err := st.sess.send(muxData, st.id, b[:n]); err != nil {
 			return total, err
 		}
 		total += n
@@ -717,7 +1114,6 @@ func (st *muxStream) Write(b []byte) (int, error) {
 	return total, nil
 }
 
-// CloseWrite sends FIN: no more data from this side.
 func (st *muxStream) CloseWrite() error {
 	st.mu.Lock()
 	if st.finSent || st.closed || st.err != nil {
@@ -727,10 +1123,9 @@ func (st *muxStream) CloseWrite() error {
 	st.finSent = true
 	st.mu.Unlock()
 	st.cond.Broadcast()
-	return st.sess.link.writeFrame(muxFin, st.id, nil)
+	return st.sess.send(muxFin, st.id, nil)
 }
 
-// Close releases the stream. If the peer has not finished, RST tells it so.
 func (st *muxStream) Close() error {
 	st.mu.Lock()
 	if st.closed {
@@ -744,13 +1139,18 @@ func (st *muxStream) Close() error {
 	st.cond.Broadcast()
 	st.sess.removeStream(st.id)
 	if needRst {
-		return st.sess.link.writeFrame(muxRst, st.id, nil)
+		return st.sess.send(muxRst, st.id, nil)
 	}
 	return nil
 }
 
-func (st *muxStream) LocalAddr() net.Addr  { return st.sess.link.conn.LocalAddr() }
-func (st *muxStream) RemoteAddr() net.Addr { return st.sess.link.conn.RemoteAddr() }
+func (st *muxStream) LocalAddr() net.Addr  { return dummyAddr{} }
+func (st *muxStream) RemoteAddr() net.Addr { return dummyAddr{} }
+
+type dummyAddr struct{}
+
+func (dummyAddr) Network() string { return "mux" }
+func (dummyAddr) String() string  { return "mux" }
 
 func (st *muxStream) SetDeadline(t time.Time) error {
 	st.mu.Lock()
@@ -803,7 +1203,6 @@ func muxServeStream(st *muxStream, host string, port int, initial []byte, d *net
 	}
 
 	done := make(chan struct{}, 2)
-	// stream -> target
 	go func() {
 		buf := make([]byte, muxMaxPayload)
 		for {
@@ -825,7 +1224,6 @@ func muxServeStream(st *muxStream, host string, port int, initial []byte, d *net
 		_ = target.Close()
 		done <- struct{}{}
 	}()
-	// target -> stream
 	go func() {
 		buf := make([]byte, muxMaxPayload)
 		for {
