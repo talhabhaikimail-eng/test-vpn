@@ -64,9 +64,10 @@ const (
 	muxDataHdr   = 8                        // uint64 offset prefix on DATA frames
 	muxDataChunk = muxMaxPayload - muxDataHdr // max application bytes per DATA frame
 
-	muxWindow    = 8 << 20          // per-stream flow-control window (bytes)
-	muxAckEvery  = 256 * 1024       // send a cumulative ACK after this many new in-order bytes
-	muxHomeBytes = 128 * 1024       // a stream's first bytes stay on its home link (latency)
+	muxWindow     = 8 << 20         // per-stream flow-control window cap (bytes)
+	muxInitWindow = 128 * 1024      // initial send window; grows per ACK (slow start) to avoid a startup burst that bloats buffers
+	muxAckEvery  = 64 * 1024        // cumulative ACK cadence; MUST be < muxInitWindow so slow-start never stalls waiting for credit
+	muxHomeBytes = 32 * 1024        // a stream's first frame stays on the control link (ordering/latency)
 
 	muxFrameTypes = 0
 
@@ -358,31 +359,38 @@ func (s *muxSession) aliveLinks() []*muxLink {
 	return out
 }
 
-// pickLink returns the next live link round-robin, or nil if none.
+// pickLink returns a live BULK link (indices 1..n-1) round-robin for data
+// striping. Link 0 is reserved for control/interactive, so a saturated bulk
+// download does not bloat the latency path. Falls back to the control link only
+// if it is the sole survivor.
 func (s *muxSession) pickLink() *muxLink {
-	s.lmu.Lock()
-	defer s.lmu.Unlock()
-	n := len(s.links)
-	for i := 0; i < n; i++ {
-		idx := int(atomic.AddUint64(&s.rrIdx, 1) % uint64(n))
-		if !s.links[idx].dead.Load() {
-			return s.links[idx]
-		}
-	}
-	return nil
-}
-
-// homeLink returns a stable link for a stream's first bytes / control frames.
-func (s *muxSession) homeLink(id uint32) *muxLink {
 	s.lmu.Lock()
 	defer s.lmu.Unlock()
 	n := len(s.links)
 	if n == 0 {
 		return nil
 	}
-	start := int(id) % n
-	for i := 0; i < n; i++ {
-		l := s.links[(start+i)%n]
+	if n >= 2 {
+		for i := 0; i < n-1; i++ {
+			idx := 1 + int(atomic.AddUint64(&s.rrIdx, 1)%uint64(n-1))
+			if !s.links[idx].dead.Load() {
+				return s.links[idx]
+			}
+		}
+	}
+	if !s.links[0].dead.Load() {
+		return s.links[0]
+	}
+	return nil
+}
+
+// homeLink returns the control link (first live link): it carries control frames
+// (OPEN/ACK/PING) and each stream's first bytes, and bulk data avoids it, so
+// interactive latency stays low even while a download saturates the bulk links.
+func (s *muxSession) homeLink(id uint32) *muxLink {
+	s.lmu.Lock()
+	defer s.lmu.Unlock()
+	for _, l := range s.links {
 		if !l.dead.Load() {
 			return l
 		}
@@ -521,7 +529,7 @@ func (s *muxSession) Ping(timeout time.Duration) (time.Duration, error) {
 		}
 		break
 	}
-	if err := s.controlWriteFast(0, muxPing, payload[:]); err != nil {
+	if err := s.controlWrite(0, muxPing, payload[:]); err != nil {
 		return 0, err
 	}
 	timer := time.NewTimer(timeout)
@@ -707,7 +715,7 @@ func (s *muxSession) serveLink(link *muxLink) error {
 			}
 
 		case muxPing:
-			_ = s.controlWriteFast(id, muxPong, payload)
+			_ = s.controlWrite(id, muxPong, payload)
 
 		case muxPong:
 			if len(payload) >= 8 {
@@ -981,6 +989,7 @@ type muxStream struct {
 	ackedOff  uint64 // peer cumulative received
 	unacked   []byte // bytes [ackedOff, sendOff)
 	peerWindow uint64
+	cwnd       uint64 // effective send window (slow-start: grows per ACK up to peerWindow)
 	finSent   bool
 	finOff    uint64
 
@@ -1007,6 +1016,7 @@ func newMuxStream(s *muxSession, id uint32) *muxStream {
 		id:         id,
 		reorder:    make(map[uint64][]byte),
 		peerWindow: muxWindow,
+		cwnd:       muxInitWindow,
 	}
 	st.cond = sync.NewCond(&st.mu)
 	return st
@@ -1017,7 +1027,11 @@ func (st *muxStream) sendOpen() error {
 	st.mu.Lock()
 	hdr := append([]byte(nil), st.openHdr...)
 	st.mu.Unlock()
-	return st.sess.controlWriteFast(st.id, muxOpen, hdr)
+	// OPEN MUST go on the stream's home link, in order ahead of the stream's
+	// first DATA bytes (which also ride the home link). If OPEN went out on a
+	// different link it could arrive after the first DATA, which the server would
+	// drop as belonging to an unknown stream.
+	return st.sess.controlWrite(st.id, muxOpen, hdr)
 }
 
 // ---- receive path ----
@@ -1082,7 +1096,8 @@ func (st *muxStream) deliver(off uint64, p []byte) {
 func (st *muxStream) sendAck(recvOff uint64) {
 	var p [8]byte
 	binary.BigEndian.PutUint64(p[:], recvOff)
-	_ = st.sess.controlWriteFast(st.id, muxAck, p[:])
+	// On the dedicated control link so ACKs never queue behind bulk data.
+	_ = st.sess.controlWrite(st.id, muxAck, p[:])
 }
 
 func (st *muxStream) peerFin(finalOff uint64) {
@@ -1107,6 +1122,13 @@ func (st *muxStream) onAck(ackOff uint64) {
 			st.unacked = append(st.unacked[:0], st.unacked[trim:]...)
 		}
 		st.ackedOff = ackOff
+		// Slow start: grow the window by the newly-acked bytes (≈ doubling per
+		// RTT) up to the cap, so the sender ramps instead of bursting the full
+		// window at once and bloating buffers (which spiked latency at startup).
+		st.cwnd += trim
+		if st.cwnd > st.peerWindow {
+			st.cwnd = st.peerWindow
+		}
 		if ackOff > 0 {
 			st.openAcked = true
 		}
@@ -1210,11 +1232,19 @@ func (st *muxStream) Write(b []byte) (int, error) {
 	total := 0
 	for len(b) > 0 {
 		st.mu.Lock()
-		// flow control: keep in-flight within the peer's window
-		for uint64(len(st.unacked)) >= st.peerWindow && st.err == nil && !st.finSent && !st.closed {
+		// flow control: keep in-flight within the effective (slow-start) window
+		win := st.cwnd
+		if st.peerWindow < win {
+			win = st.peerWindow
+		}
+		for uint64(len(st.unacked)) >= win && st.err == nil && !st.finSent && !st.closed {
 			if !st.waitLocked(st.writeDeadline) {
 				st.mu.Unlock()
 				return total, errMuxTimeout
+			}
+			win = st.cwnd
+			if st.peerWindow < win {
+				win = st.peerWindow
 			}
 		}
 		if st.err != nil {
@@ -1230,8 +1260,8 @@ func (st *muxStream) Write(b []byte) (int, error) {
 		if n > muxDataChunk {
 			n = muxDataChunk
 		}
-		// cap to remaining window
-		if room := int(st.peerWindow) - len(st.unacked); n > room {
+		// cap to remaining effective window
+		if room := int(win) - len(st.unacked); n > room {
 			n = room
 		}
 		if n <= 0 {
