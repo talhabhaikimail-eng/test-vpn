@@ -50,6 +50,26 @@ python generate_v2ray_links.py            # import links (XHTTP, VLESS WS, VMess
 python test_v2ray.py --data --ed -n 10    # WS end-to-end TTFB benchmark (VLESS)
 ```
 
+### `/mux` session protocol (Download Engine / WSTunnel desktop client)
+
+The same node also serves a purpose-built transport on the `/mux` path for the Windows client
+(`D:\download-engine\pkg\tunnel`, profile **Onic Mux (Fast)**). The client opens one "WebSocket"
+through the bug host and multiplexes every TCP connection and DNS query over it with AES-256-GCM
+framing (`muxproto.go`, shared verbatim with the client; `muxserver.go` is the in-process handler).
+A stream opens without a confirmation round trip and DNS is answered in one frame on the node.
+
+Measured from Pakistan via the bug host (same session, new connection each request):
+
+| | SSH over WS | `/mux` |
+| :--- | :--- | :--- |
+| Connect | ~2.5 s | ~1.2 s |
+| New HTTP connection (TTFB) | ~600 ms | ~305 ms |
+| New HTTPS connection (TTFB) | ~925 ms | ~640 ms |
+| DNS lookup | ~660 ms (2 round trips) | ~310 ms |
+
+The pre-shared key is `secrets.SSH_PASSWORD` (installed as `/etc/v2ray/mux.key` by `setup_v2ray.sh`
+when `MUX_PSK` is set; without it `/mux` is disabled). The handler refuses loopback and private targets.
+
 ## Testing & Benchmarking
 
 Use the built-in [test_proxy.py](file:///test_proxy.py) benchmark tool:
