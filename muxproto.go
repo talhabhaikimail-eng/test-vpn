@@ -218,6 +218,31 @@ func (l *muxLink) writeData(id uint32, offset uint64, body []byte) error {
 	return nil
 }
 
+// tryWriteFrame writes a frame only if the link's write lock is immediately
+// free, so a latency-sensitive control frame never waits behind a bulk DATA
+// write that is blocked on TCP backpressure. Returns false if the link is busy.
+func (l *muxLink) tryWriteFrame(typ byte, id uint32, payload []byte) (bool, error) {
+	if !l.wmu.TryLock() {
+		return false, nil
+	}
+	defer l.wmu.Unlock()
+	if l.dead.Load() {
+		return true, net.ErrClosed
+	}
+	plain := l.pbuf[:muxFrameHdr+len(payload)]
+	plain[0] = typ
+	binary.BigEndian.PutUint32(plain[1:5], id)
+	copy(plain[5:], payload)
+	ctLen := len(plain) + l.enc.aead.Overhead()
+	binary.BigEndian.PutUint16(l.wbuf[:2], uint16(ctLen))
+	l.enc.aead.Seal(l.wbuf[2:2], l.enc.next(), plain, l.wbuf[:2])
+	if _, err := l.conn.Write(l.wbuf[:2+ctLen]); err != nil {
+		l.dead.Store(true)
+		return true, err
+	}
+	return true, nil
+}
+
 func (l *muxLink) readFrame() (typ byte, id uint32, payload []byte, err error) {
 	var hdr [2]byte
 	if _, err = io.ReadFull(l.r, hdr[:]); err != nil {
@@ -466,6 +491,23 @@ func (s *muxSession) controlWrite(id uint32, typ byte, payload []byte) error {
 	return nil
 }
 
+// controlWriteFast sends a small control frame on the first link whose write
+// lock is free (avoiding head-of-line blocking behind bulk data). If every link
+// is busy it falls back to a blocking write on the stream's home link.
+func (s *muxSession) controlWriteFast(id uint32, typ byte, payload []byte) error {
+	for _, l := range s.aliveLinks() {
+		ok, err := l.tryWriteFrame(typ, id, payload)
+		if err != nil {
+			go s.onLinkError(l)
+			continue
+		}
+		if ok {
+			return nil
+		}
+	}
+	return s.controlWrite(id, typ, payload)
+}
+
 // Ping sends a PING on one link and waits for the matching PONG.
 func (s *muxSession) Ping(timeout time.Duration) (time.Duration, error) {
 	var payload [8]byte
@@ -479,12 +521,7 @@ func (s *muxSession) Ping(timeout time.Duration) (time.Duration, error) {
 		}
 		break
 	}
-	l := s.pickLink()
-	if l == nil {
-		return 0, errMuxClosed
-	}
-	if err := l.writeFrame(muxPing, 0, payload[:]); err != nil {
-		go s.onLinkError(l)
+	if err := s.controlWriteFast(0, muxPing, payload[:]); err != nil {
 		return 0, err
 	}
 	timer := time.NewTimer(timeout)
@@ -670,7 +707,7 @@ func (s *muxSession) serveLink(link *muxLink) error {
 			}
 
 		case muxPing:
-			_ = s.controlWrite(id, muxPong, payload)
+			_ = s.controlWriteFast(id, muxPong, payload)
 
 		case muxPong:
 			if len(payload) >= 8 {
@@ -980,7 +1017,7 @@ func (st *muxStream) sendOpen() error {
 	st.mu.Lock()
 	hdr := append([]byte(nil), st.openHdr...)
 	st.mu.Unlock()
-	return st.sess.controlWrite(st.id, muxOpen, hdr)
+	return st.sess.controlWriteFast(st.id, muxOpen, hdr)
 }
 
 // ---- receive path ----
@@ -1045,15 +1082,17 @@ func (st *muxStream) deliver(off uint64, p []byte) {
 func (st *muxStream) sendAck(recvOff uint64) {
 	var p [8]byte
 	binary.BigEndian.PutUint64(p[:], recvOff)
-	_ = st.sess.controlWrite(st.id, muxAck, p[:])
+	_ = st.sess.controlWriteFast(st.id, muxAck, p[:])
 }
 
 func (st *muxStream) peerFin(finalOff uint64) {
 	st.mu.Lock()
 	st.finRecv = true
 	st.finRecvAt = finalOff
+	recvOff := st.recvOff
 	st.mu.Unlock()
 	st.cond.Broadcast()
+	st.sendAck(recvOff)
 }
 
 // ---- send path ----
