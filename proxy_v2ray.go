@@ -3,6 +3,7 @@
 //
 //	WebSocket upgrade  /vless, /          -> VLESS WS inbound   (raw splice after hijack)
 //	WebSocket upgrade  /vmess             -> VMess WS inbound   (raw splice after hijack)
+//	WebSocket upgrade  /mux               -> in-process mux session (muxserver.go)
 //	plain HTTP         /xh, /xh/...       -> VLESS XHTTP inbound (HTTP reverse proxy)
 //	plain HTTP         /health, /ping     -> answered here
 //	plain HTTP         anything else      -> optional web panel (--http) or 404
@@ -137,6 +138,7 @@ type router struct {
 	vless, vmess string
 	xhttpPrefix  string
 	xhttp, ui    *httputil.ReverseProxy
+	muxKey       []byte // pre-shared key for the /mux session protocol (nil = disabled)
 	hijacked     sync.WaitGroup
 }
 
@@ -183,6 +185,8 @@ func (rt *router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Server-Info", banner)
 		w.Header().Set("Cache-Control", "no-store")
 		_, _ = fmt.Fprintf(w, "OK - %s\n", banner)
+	case ws && rt.muxKey != nil && (p == "/mux" || strings.HasPrefix(p, "/mux/")):
+		rt.serveMux(w, r)
 	case ws:
 		rt.serveWebSocket(w, r)
 	case rt.xhttp != nil && (p == rt.xhttpPrefix || strings.HasPrefix(p, rt.xhttpPrefix+"/")):
@@ -269,6 +273,7 @@ func main() {
 	xhttp := flag.String("xhttp", "127.0.0.1:10087", "upstream VLESS XHTTP inbound (empty to disable)")
 	xhttpPath := flag.String("xhttp-path", "/xh", "path prefix routed to the XHTTP inbound")
 	httpUp := flag.String("http", "", "optional upstream for other plain HTTP requests (web panel)")
+	muxKeyFile := flag.String("mux-key-file", "/etc/v2ray/mux.key", "pre-shared key file for the /mux session protocol (missing = disabled)")
 	maxConns := flag.Int("max-conns", 2048, "max concurrent connections")
 	name := flag.String("name", "V2Ray Node 1", "server instance name")
 	flag.Parse()
@@ -283,6 +288,12 @@ func main() {
 	}
 	if *httpUp != "" {
 		rt.ui = newReverseProxy(*httpUp)
+	}
+	if key, err := muxReadPSKFile(*muxKeyFile); err == nil {
+		rt.muxKey = key
+		log.Printf("[V2Ray-Proxy] /mux session protocol enabled")
+	} else {
+		log.Printf("[V2Ray-Proxy] /mux disabled: %v", err)
 	}
 
 	addr, err := net.ResolveTCPAddr("tcp", *listen)
@@ -302,8 +313,8 @@ func main() {
 		MaxHeaderBytes:    maxHeaderBytes,
 	}
 
-	log.Printf("[V2Ray-Proxy] %s -> VLESS-WS:%s | VMess-WS:%s | XHTTP:%s%s | panel:%s (max-conns=%d)",
-		*listen, *vless, *vmess, *xhttp, rt.xhttpPrefix, *httpUp, *maxConns)
+	log.Printf("[V2Ray-Proxy] %s -> VLESS-WS:%s | VMess-WS:%s | XHTTP:%s%s | mux:%v | panel:%s (max-conns=%d)",
+		*listen, *vless, *vmess, *xhttp, rt.xhttpPrefix, rt.muxKey != nil, *httpUp, *maxConns)
 	log.Printf("[V2Ray-Proxy] %s", serverBanner())
 
 	go func() {

@@ -128,9 +128,10 @@ jobs:
           echo "BBR: $(cat /proc/sys/net/ipv4/tcp_congestion_control)"
 
       # ── V2Ray Core Setup ────────────────────────────────────────────────────
-      - name: Setup & Start Xray-core (VLESS XHTTP + VLESS/VMess WS)
+      - name: Setup & Start Xray-core (VLESS XHTTP + VLESS/VMess WS + /mux)
         env:
           V2RAY_UUID: ${{ secrets.V2RAY_UUID }}
+          MUX_PSK: ${{ secrets.SSH_PASSWORD }}
         run: |
           chmod +x setup_v2ray.sh
           sudo -E ./setup_v2ray.sh "V2Ray Node"

@@ -166,14 +166,23 @@ if ! sudo /usr/local/bin/xray run -test -c /etc/v2ray/config.json -format json; 
   echo "[!] Xray config failed validation"; exit 1
 fi
 
-# 5. Build proxy_v2ray (Go router & TCP optimizer)
+# 5. Build proxy_v2ray (Go router & TCP optimizer + in-process /mux session server)
 if command -v go &>/dev/null && [ -f proxy_v2ray.go ]; then
   echo "[+] Compiling proxy_v2ray Go binary..."
-  if [ -f quickack_linux.go ]; then
-    go build -o proxy_v2ray_bin proxy_v2ray.go quickack_linux.go
-  else
-    go build -o proxy_v2ray_bin proxy_v2ray.go
-  fi
+  SRCS="proxy_v2ray.go"
+  [ -f muxproto.go ] && [ -f muxserver.go ] && SRCS="$SRCS muxproto.go muxserver.go"
+  [ -f quickack_linux.go ] && SRCS="$SRCS quickack_linux.go"
+  go build -o proxy_v2ray_bin $SRCS
+fi
+
+# 5b. /mux pre-shared key (from the MUX_PSK env, i.e. secrets.SSH_PASSWORD). No key = /mux disabled.
+if [ -n "${MUX_PSK:-}" ]; then
+  printf '%s' "$MUX_PSK" | sudo tee /etc/v2ray/mux.key > /dev/null
+  sudo chmod 600 /etc/v2ray/mux.key
+  echo "[+] /mux key installed at /etc/v2ray/mux.key"
+else
+  sudo rm -f /etc/v2ray/mux.key
+  echo "[i] MUX_PSK not set; /mux session protocol disabled on this node"
 fi
 
 # 6. Start Xray (via the v2ray symlink so "pgrep -f \"v2ray run\"" watchdogs match)
