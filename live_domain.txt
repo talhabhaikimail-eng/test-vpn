@@ -1,2 +1,2 @@
 tunnel.ufone-claim.site
-nearest-tokyo-modifications-consistently.trycloudflare.com
+tunnel2.ufone-claim.site
