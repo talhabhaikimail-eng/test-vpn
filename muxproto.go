@@ -367,20 +367,19 @@ func (s *muxSession) installLink(link *muxLink, peerRx uint64) {
 		s.replay = append([]muxReplayEntry(nil), s.replay[i:]...)
 	}
 	s.link = link
-	backlog := make([]muxReplayEntry, len(s.replay))
-	copy(backlog, s.replay)
-	s.wmu.Unlock()
-
-	for _, e := range backlog {
+	// Replay the backlog while still holding wmu. A single link delivers frames
+	// in arrival order, so the wire order MUST equal seq order; if we unlocked
+	// first, a concurrent send() could write a newer frame in between replayed
+	// ones and the peer would deliver bytes out of order (stream corruption).
+	for _, e := range s.replay {
 		if err := link.writeFrame(e.typ, e.id, e.payload); err != nil {
-			s.wmu.Lock()
 			if s.link == link {
 				s.link = nil
 			}
-			s.wmu.Unlock()
 			break
 		}
 	}
+	s.wmu.Unlock()
 	s.linkCond.Broadcast()
 }
 
