@@ -1,2 +1,2 @@
 tunnel.ufone-claim.site
-peripherals-cathedral-featuring-smtp.trycloudflare.com
+tunnel2.ufone-claim.site
