@@ -1,2 +1,2 @@
 tunnel.ufone-claim.site
-earthquake-alpine-newton-resume.trycloudflare.com
+tunnel2.ufone-claim.site
