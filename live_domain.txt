@@ -1,2 +1,2 @@
 tunnel.ufone-claim.site
-brands-handy-ict-karaoke.trycloudflare.com
+tunnel2.ufone-claim.site
