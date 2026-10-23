@@ -21,7 +21,7 @@ services:
         - muxserver.go
         - .dockerignore
     domains:
-      - v2ray-sg.ufone-claim.site
+      - v2ray-sg.talhacodes.site
     envVars:
       - key: V2RAY_UUID
         sync: false
@@ -39,4 +39,4 @@ services:
       - key: BUG_HOST
         value: jsbl.com
       - key: PUBLIC_HOST
-        value: v2ray-sg.ufone-claim.site
+        value: v2ray-sg.talhacodes.site

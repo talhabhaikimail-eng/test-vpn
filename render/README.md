@@ -20,9 +20,9 @@ client --TLS--> Cloudflare edge (bug host jsbl.com) --> Render Singapore :$PORT
 2. Wait for the deploy, then open `https://v2ray-sg.onrender.com/health` (your service URL may differ). It should say `OK`.
 3. **Custom domain** (needed for the bug host to work, since the bug host only reaches Cloudflare):
    1. Cloudflare DNS → add `CNAME v2ray-sg` → `<your-service>.onrender.com`, **DNS only (grey cloud)**.
-   2. Render → service → Settings → Custom Domains → verify `v2ray-sg.ufone-claim.site` and wait for the certificate.
+   2. Render → service → Settings → Custom Domains → verify `v2ray-sg.talhacodes.site` and wait for the certificate.
    3. Switch the Cloudflare record to **Proxied (orange cloud)**. SSL/TLS mode must be **Full** or **Full (strict)**.
-4. **Panel**: open `https://v2ray-sg.ufone-claim.site/`, log in as `admin` with **UI_PASSWORD**
+4. **Panel**: open `https://v2ray-sg.talhacodes.site/`, log in as `admin` with **UI_PASSWORD**
    (Render → Environment tab; it was generated for you). Copy the links or scan the QR codes.
 
 ## Client settings
@@ -31,13 +31,13 @@ client --TLS--> Cloudflare edge (bug host jsbl.com) --> Render Singapore :$PORT
 |---|---|
 | Address | `jsbl.com` (bug host) |
 | Port / TLS | `443` / on |
-| SNI and Host | `v2ray-sg.ufone-claim.site` |
+| SNI and Host | `v2ray-sg.talhacodes.site` |
 | Network / Path | `ws` / `/vless?ed=2048` (VMess: `/vmess?ed=2048`) |
 
 ## Test from your PC
 
 ```
-python test_v2ray.py --data --ed --domain v2ray-sg.ufone-claim.site -n 20
+python test_v2ray.py --data --ed --domain v2ray-sg.talhacodes.site -n 20
 ```
 
 ## Environment variables
