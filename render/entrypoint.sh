@@ -18,6 +18,16 @@ V2_PID=$!
 sleep 1
 kill -0 "$V2_PID"
 
+# /mux session protocol key (same PSK the client uses). No key = /mux disabled.
+MUX_ARG=""
+if [ -n "${MUX_PSK:-}" ]; then
+  printf '%s' "$MUX_PSK" > /tmp/mux.key
+  chmod 600 /tmp/mux.key
+  MUX_ARG="--mux-key-file /tmp/mux.key"
+else
+  echo "[entrypoint] MUX_PSK not set; /mux disabled" >&2
+fi
+
 # Web panel (config links + speed test) only when a password is set: it shows the UUID.
 UI_PID=""
 HTTP_ARG=""
@@ -30,7 +40,7 @@ else
 fi
 
 # shellcheck disable=SC2086
-proxy_v2ray --listen "0.0.0.0:${PORT}" --vless 127.0.0.1:10085 --vmess 127.0.0.1:10086 $HTTP_ARG --name "$NODE_NAME" &
+proxy_v2ray --listen "0.0.0.0:${PORT}" --vless 127.0.0.1:10085 --vmess 127.0.0.1:10086 $HTTP_ARG $MUX_ARG --name "$NODE_NAME" &
 PX_PID=$!
 
 trap 'kill "$V2_PID" "$PX_PID" $UI_PID 2>/dev/null; exit 0' TERM INT

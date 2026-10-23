@@ -17,11 +17,16 @@ services:
         - render.yaml
         - proxy_v2ray.go
         - quickack_linux.go
+        - muxproto.go
+        - muxserver.go
         - .dockerignore
     domains:
       - v2ray-sg.ufone-claim.site
     envVars:
       - key: V2RAY_UUID
+        sync: false
+      # /mux pre-shared key = the SSH password (GitHub secret SSH_PASSWORD). Unset = /mux disabled.
+      - key: MUX_PSK
         sync: false
       - key: NODE_NAME
         value: V2Ray SG (Render)

@@ -6,9 +6,9 @@
 # ── Build the Go path router / TCP tuner + web panel ──────────────────────────────────────
 FROM golang:1.25-alpine AS build
 WORKDIR /src
-COPY proxy_v2ray.go quickack_linux.go ./
+COPY proxy_v2ray.go quickack_linux.go muxproto.go muxserver.go ./
 COPY render/ui/main.go ./ui/main.go
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/proxy_v2ray proxy_v2ray.go quickack_linux.go \
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/proxy_v2ray proxy_v2ray.go quickack_linux.go muxproto.go muxserver.go \
  && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/v2ray_ui ./ui/main.go
 
 # ── Fetch official V2Ray Core (pinned) ────────────────────────────────────────
