@@ -1,2 +1,2 @@
 tunnel.ufone-claim.site
-differences-lite-actress-monitored.trycloudflare.com
+tunnel2.ufone-claim.site
