@@ -1,2 +1,2 @@
 tunnel.ufone-claim.site
-veteran-sensor-exploration-retrieval.trycloudflare.com
+tunnel2.ufone-claim.site
