@@ -1,2 +1,2 @@
 tunnel.ufone-claim.site
-over-stay-austin-blake.trycloudflare.com
+tunnel2.ufone-claim.site
