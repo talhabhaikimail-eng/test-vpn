@@ -267,7 +267,8 @@ type muxSession struct {
 	pongCh   chan int64
 	helloCh  chan struct{}
 
-	reg *muxResumeRegistry // server only
+	reg       *muxResumeRegistry // server only
+	detachGen atomic.Uint64      // server only: bumped each time the session detaches
 }
 
 func newMuxSession(link *muxLink, isClient bool) *muxSession {
@@ -365,6 +366,13 @@ func (s *muxSession) installLink(link *muxLink, peerRx uint64) {
 	}
 	if i > 0 {
 		s.replay = append([]muxReplayEntry(nil), s.replay[i:]...)
+	}
+	// A resume can arrive before the server notices the old link died (a silent
+	// carrier drop or a Cloudflare edge that has not closed it yet). Close it so
+	// its serveLink exits now instead of lingering and later detaching the
+	// session out from under the new link.
+	if old := s.link; old != nil && old != link {
+		defer old.close()
 	}
 	s.link = link
 	// Replay the backlog while still holding wmu. A single link delivers frames
@@ -868,7 +876,7 @@ func muxServerConn(conn net.Conn, psk []byte, reg *muxResumeRegistry, grace time
 			log("mux: session resumed")
 		}
 		serr := sess.serveWithIdle(link, muxServerIdle)
-		muxServerAfterServe(sess, reg, grace)
+		muxServerAfterServe(sess, link, reg, grace)
 		_ = serr
 
 	case muxHello:
@@ -885,7 +893,7 @@ func muxServerConn(conn net.Conn, psk []byte, reg *muxResumeRegistry, grace time
 		// be answered by serveLink.
 		_ = link.writeFrame(muxHello, 0, sess.sessionID[:])
 		serr := sess.serveWithIdle(link, muxServerIdle)
-		muxServerAfterServe(sess, reg, grace)
+		muxServerAfterServe(sess, link, reg, grace)
 		_ = serr
 
 	default:
@@ -921,22 +929,31 @@ func (s *muxSession) serveWithIdle(link *muxLink, idle time.Duration) error {
 // muxServerIdle drops an attached server link after this much silence.
 const muxServerIdle = 150 * time.Second
 
-// muxServerAfterServe decides what to do when a server link drops: if the
-// session is still open, hold it in the registry for the grace period so the
-// client can resume; otherwise it is already gone.
-func muxServerAfterServe(sess *muxSession, reg *muxResumeRegistry, grace time.Duration) {
+// muxServerAfterServe decides what to do when the server link `link` drops: if
+// the session is still open, hold it in the registry for the grace period so
+// the client can resume; otherwise it is already gone.
+func muxServerAfterServe(sess *muxSession, link *muxLink, reg *muxResumeRegistry, grace time.Duration) {
 	if sess.Closed() {
 		return
 	}
 	sess.wmu.Lock()
+	if sess.link != nil && sess.link != link {
+		// A resume already moved the session onto a newer link; this one is a
+		// stale leftover and must not detach the live session.
+		sess.wmu.Unlock()
+		return
+	}
 	sess.link = nil
+	gen := sess.detachGen.Add(1)
 	sess.wmu.Unlock()
 	reg.put(sess)
-	// Grace timer: if nobody resumes within the window, close it. If a resume
-	// adopts it first, take() removes it from the registry and serveLink runs
-	// again, so this timer closing a since-readopted session is prevented by
-	// checking that it is still the registry's entry.
+	// Grace timer: if nobody resumes within the window, close it. A timer from
+	// an earlier detach must not close a session that has since been resumed
+	// and detached again, so it only acts while its detach is the latest one.
 	time.AfterFunc(grace, func() {
+		if sess.detachGen.Load() != gen {
+			return
+		}
 		if s := reg.take(sess.sessionID); s == sess {
 			_ = s.closeWith(fmt.Errorf("mux: resume grace expired"))
 		} else if s != nil {
