@@ -1,2 +1,2 @@
 tunnel.ufone-claim.site
-hobby-exclude-separated-creature.trycloudflare.com
+tunnel2.ufone-claim.site
