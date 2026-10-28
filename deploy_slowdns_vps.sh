@@ -6,7 +6,7 @@ set -e
 # Memory Envelope: Max 128MB RAM | CPU Cap: 75% of 1 vCPU
 # ==============================================================================
 
-DOMAIN="dns.ufone-claim.site"
+DOMAIN="dns.talhacodes.site"
 TARGET="127.0.0.1:22"
 INSTALL_DIR="/opt/dnstt"
 

@@ -9,3 +9,5 @@ __pycache__/
 *.key
 *.pem
 .v2ray_uuid
+.wrangler/
+node_modules/

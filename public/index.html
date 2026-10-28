@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ProxyScope Live</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%233987e5' stroke-width='2.5' stroke-linecap='round'%3E%3Cpolyline points='2 12 6 12 9 4 15 20 18 12 22 12'/%3E%3C/svg%3E">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="2 12 6 12 9 4 15 20 18 12 22 12"/></svg>
+      <div>
+        <h1>ProxyScope <span class="brand-live">Live</span></h1>
+        <p class="brand-sub">Packet-level latency &amp; stability for every tunnel</p>
+      </div>
+    </div>
+
+    <div class="topbar-controls">
+      <label class="ctl">
+        <span>Interval</span>
+        <select id="opt-interval">
+          <option value="500">0.5 s</option>
+          <option value="1000" selected>1 s</option>
+          <option value="2000">2 s</option>
+          <option value="5000">5 s</option>
+        </select>
+      </label>
+      <label class="ctl">
+        <span>Timeout</span>
+        <select id="opt-timeout">
+          <option value="2000">2 s</option>
+          <option value="3000">3 s</option>
+          <option value="5000" selected>5 s</option>
+          <option value="10000">10 s</option>
+        </select>
+      </label>
+      <label class="ctl">
+        <span>Payload</span>
+        <select id="opt-size">
+          <option value="32">32 B</option>
+          <option value="64" selected>64 B</option>
+          <option value="512">512 B</option>
+          <option value="1400">1400 B</option>
+        </select>
+      </label>
+      <button class="btn btn-primary" id="btn-start-all">
+        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><polygon points="6 4 20 12 6 20"/></svg>
+        Monitor all
+      </button>
+      <button class="btn" id="btn-stop-all">
+        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1.5"/></svg>
+        Stop all
+      </button>
+      <button class="btn" id="btn-custom">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        Custom node
+      </button>
+      <button class="btn btn-icon" id="btn-theme" title="Toggle light / dark" aria-label="Toggle theme">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+      </button>
+      <span class="link-state" id="link-state" title="Connection to the local ProxyScope server"><span class="dot"></span><span class="txt">Connecting…</span></span>
+    </div>
+  </header>
+
+  <section class="summary" id="summary">
+    <div class="tile"><span class="tile-label">Nodes up</span><span class="tile-value" id="sum-up">–</span><span class="tile-sub" id="sum-up-sub">not monitoring</span></div>
+    <div class="tile"><span class="tile-label">Best live RTT</span><span class="tile-value"><span id="sum-best">–</span><small> ms</small></span><span class="tile-sub" id="sum-best-sub">&nbsp;</span></div>
+    <div class="tile"><span class="tile-label">Packets</span><span class="tile-value" id="sum-pkts">0</span><span class="tile-sub" id="sum-pkts-sub">sent across all nodes</span></div>
+    <div class="tile"><span class="tile-label">Packet loss</span><span class="tile-value"><span id="sum-loss">–</span><small> %</small></span><span class="tile-sub" id="sum-loss-sub">&nbsp;</span></div>
+    <div class="tile"><span class="tile-label">Reconnects</span><span class="tile-value" id="sum-rc">0</span><span class="tile-sub">tunnel drops recovered</span></div>
+  </section>
+
+  <div class="layout">
+    <aside class="nodes" id="node-list" aria-label="Nodes">
+      <div class="empty">Loading nodes…</div>
+    </aside>
+
+    <main class="detail" id="detail">
+      <div class="panel detail-head">
+        <div class="dh-left">
+          <div class="dh-title-row">
+            <h2 id="d-name">–</h2>
+            <span class="state-chip" id="d-state" data-state="idle"><span class="dot"></span><span class="txt">Idle</span></span>
+          </div>
+          <p class="dh-meta" id="d-meta">&nbsp;</p>
+          <p class="dh-method" id="d-method">&nbsp;</p>
+        </div>
+        <div class="dh-actions">
+          <button class="btn btn-primary" id="d-toggle">Start monitor</button>
+          <button class="btn" id="d-probe" title="Open 5 fresh connections and time every handshake stage">Cold handshake ×5</button>
+          <button class="btn" id="d-clear">Clear</button>
+          <button class="btn" id="d-export" title="Download all packets as CSV">Export CSV</button>
+        </div>
+      </div>
+
+      <div class="panel chart-panel">
+        <div class="chart-head">
+          <div>
+            <h3 id="chart-title">Latency &amp; stability</h3>
+            <p class="chart-sub" id="chart-sub">Every dot is one packet's round trip · stability = delivered % over the last 20 packets, reduced by jitter</p>
+          </div>
+          <div class="chart-tools">
+            <div class="seg" id="mode-seg" role="group" aria-label="Chart scope">
+              <button data-mode="one" class="on">This node</button>
+              <button data-mode="all">All nodes</button>
+            </div>
+            <div class="legend" id="legend-one" aria-hidden="true">
+              <span class="lg"><i class="lg-line lat"></i>Round trip (ms)</span>
+              <span class="lg"><i class="lg-area stab"></i>Stability (%)</span>
+              <span class="lg"><i class="lg-x"></i>Lost packet</span>
+              <span class="lg"><i class="lg-band"></i>Tunnel down</span>
+            </div>
+            <div class="seg" id="win-seg" role="group" aria-label="Time window">
+              <button data-win="60">1m</button>
+              <button data-win="300" class="on">5m</button>
+              <button data-win="900">15m</button>
+              <button data-win="0">All</button>
+            </div>
+          </div>
+        </div>
+        <div class="series-legend" id="legend-all" hidden aria-label="Nodes in chart"></div>
+        <div class="chart-wrap" id="chart-wrap">
+          <canvas id="chart" role="img" aria-label="Round trip latency and stability over time"></canvas>
+          <div class="tooltip" id="tooltip" hidden></div>
+          <div class="chart-empty" id="chart-empty">Press <b>Start monitor</b> to send packets through this tunnel.</div>
+        </div>
+      </div>
+
+      <div class="stats" id="stats">
+        <div class="stat"><span class="k">Sent</span><span class="v" id="s-sent">0</span></div>
+        <div class="stat"><span class="k">Received</span><span class="v" id="s-recv">0</span></div>
+        <div class="stat"><span class="k">Lost</span><span class="v" id="s-lost">0</span></div>
+        <div class="stat"><span class="k">Loss</span><span class="v"><span id="s-loss">–</span><small>%</small></span></div>
+        <div class="stat"><span class="k">Last</span><span class="v"><span id="s-last">–</span><small>ms</small></span></div>
+        <div class="stat"><span class="k">Min</span><span class="v"><span id="s-min">–</span><small>ms</small></span></div>
+        <div class="stat"><span class="k">Avg</span><span class="v"><span id="s-avg">–</span><small>ms</small></span></div>
+        <div class="stat"><span class="k">P95</span><span class="v"><span id="s-p95">–</span><small>ms</small></span></div>
+        <div class="stat"><span class="k">Max</span><span class="v"><span id="s-max">–</span><small>ms</small></span></div>
+        <div class="stat"><span class="k">Jitter</span><span class="v"><span id="s-jit">–</span><small>ms</small></span></div>
+        <div class="stat"><span class="k">Stability</span><span class="v"><span id="s-stab">–</span><small>%</small></span></div>
+        <div class="stat"><span class="k">Session</span><span class="v" id="s-up">–</span></div>
+      </div>
+
+      <div class="panel" id="mx-panel">
+        <div class="chart-head">
+          <div>
+            <h3>Bug IP matrix</h3>
+            <p class="chart-sub">Every node dialled through every candidate front IP (Host / SNI unchanged) · one row per IP, one lane per node · dot = median live RTT, whisker = min–max</p>
+          </div>
+          <div class="chart-tools">
+            <div class="seg" id="mx-metric" role="group" aria-label="Matrix metric">
+              <button data-m="rtt" class="on">Live RTT</button>
+              <button data-m="connect">Connect time</button>
+            </div>
+            <div class="seg" id="mx-sort" role="group" aria-label="Row order">
+              <button data-s="input" class="on">As entered</button>
+              <button data-s="best">Best first</button>
+            </div>
+          </div>
+        </div>
+        <div class="mx-form">
+          <label class="mx-ips">IPs / hosts <span class="muted">(one per line, spaces and commas fine)</span>
+            <textarea id="mx-ips" rows="4" spellcheck="false" placeholder="104.16.15.14&#10;104.19.251.92"></textarea>
+          </label>
+          <div class="mx-side">
+            <div class="mx-nodes" id="mx-nodes" aria-label="Nodes to test"></div>
+            <div class="mx-run">
+              <label class="ctl"><span>Packets</span>
+                <select id="mx-pings"><option value="5">5</option><option value="10" selected>10</option><option value="20">20</option><option value="40">40</option></select>
+              </label>
+              <label class="ctl"><span>Parallel</span>
+                <select id="mx-workers"><option value="3">3</option><option value="6" selected>6</option><option value="10">10</option></select>
+              </label>
+              <button class="btn btn-primary" id="mx-start">Run matrix</button>
+              <button class="btn" id="mx-stop" disabled>Stop</button>
+              <button class="btn" id="mx-export" disabled>Export CSV</button>
+              <span class="muted small" id="mx-progress">&nbsp;</span>
+            </div>
+          </div>
+        </div>
+        <div class="series-legend" id="mx-legend" aria-label="Nodes in matrix"></div>
+        <div class="chart-wrap mx-wrap" id="mx-wrap">
+          <canvas id="mx-chart" role="img" aria-label="Latency of every node through every bug IP"></canvas>
+          <div class="tooltip" id="mx-tip" hidden></div>
+          <div class="chart-empty" id="mx-empty">Paste bug IPs and press <b>Run matrix</b>.</div>
+        </div>
+        <div class="table-wrap">
+          <table class="probes mx-table">
+            <thead id="mx-thead"></thead>
+            <tbody id="mx-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="panel">
+          <div class="panel-head">
+            <h3>Connection setup</h3>
+            <span class="muted" id="d-conn-total">&nbsp;</span>
+          </div>
+          <div class="waterfall" id="waterfall"><div class="muted small">No connection yet.</div></div>
+          <dl class="info" id="conn-info"></dl>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h3>Speed test</h3>
+            <div class="speed-tools">
+              <select id="speed-size" aria-label="Transfer size">
+                <option value="1048576">1 MB</option>
+                <option value="4194304" selected>4 MB</option>
+                <option value="16777216">16 MB</option>
+                <option value="52428800">50 MB</option>
+              </select>
+              <button class="btn btn-sm" id="d-speed">Run</button>
+            </div>
+          </div>
+          <div class="speed" id="speed">
+            <div class="gauge" data-dir="down">
+              <span class="g-label">↓ Download</span>
+              <span class="g-val"><span class="g-num">–</span><small> Mbps</small></span>
+              <div class="g-bar"><i></i></div>
+              <span class="g-sub">&nbsp;</span>
+            </div>
+            <div class="gauge" data-dir="up">
+              <span class="g-label">↑ Upload</span>
+              <span class="g-val"><span class="g-num">–</span><small> Mbps</small></span>
+              <div class="g-bar"><i></i></div>
+              <span class="g-sub">&nbsp;</span>
+            </div>
+          </div>
+          <p class="muted small" id="speed-note">&nbsp;</p>
+        </div>
+      </div>
+
+      <div class="panel" id="probe-panel">
+        <div class="panel-head">
+          <h3>Cold handshakes</h3>
+          <span class="muted small">A brand-new connection each time — what every new app connection pays before data flows</span>
+        </div>
+        <div class="table-wrap">
+          <table class="probes">
+            <thead><tr><th>#</th><th>DNS</th><th>TCP</th><th>TLS</th><th>Upgrade</th><th>Origin / first req</th><th>Total</th><th>Result</th></tr></thead>
+            <tbody id="probe-rows"><tr><td colspan="8" class="muted">Run “Cold handshake ×5” to measure.</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel console-panel">
+        <div class="panel-head">
+          <h3>Packet console</h3>
+          <div class="console-tools">
+            <div class="seg" id="log-filter" role="group" aria-label="Console filter">
+              <button data-f="all" class="on">All</button>
+              <button data-f="pkt">Packets</button>
+              <button data-f="evt">Events</button>
+            </div>
+            <label class="check"><input type="checkbox" id="log-allnodes"> All nodes</label>
+            <label class="check"><input type="checkbox" id="log-follow" checked> Follow</label>
+          </div>
+        </div>
+        <div class="console" id="console" role="log" aria-live="off"></div>
+      </div>
+    </main>
+  </div>
+
+  <dialog class="modal" id="custom-modal">
+    <form method="dialog" id="custom-form">
+      <h3>Add a custom node</h3>
+      <p class="muted small">Tested from this machine with the same packet engine. SSH methods use SSH_USER / SSH_PASS from <code>.env</code>; VLESS / VMess use <code>.v2ray_uuid</code>.</p>
+      <label>Host (SNI / Host header)<input id="c-host" required placeholder="tunnel.example.com"></label>
+      <div class="row">
+        <label>Connect via (bug host, optional)<input id="c-front" placeholder="jsbl.com"></label>
+        <label class="narrow">Port<input id="c-port" type="number" placeholder="80"></label>
+      </div>
+      <div class="row">
+        <label>Path<input id="c-path" value="/"></label>
+        <label>Method
+          <select id="c-method">
+            <option value="ws_ping">WebSocket ping/pong</option>
+            <option value="ssh_ws">SSH echo (raw WS proxy)</option>
+            <option value="udp_ssh">SSH echo (framed UDP proxy)</option>
+            <option value="vless">VLESS over WS</option>
+            <option value="vmess">VMess over WS</option>
+            <option value="http">HTTP keep-alive GET</option>
+          </select>
+        </label>
+      </div>
+      <label class="check"><input type="checkbox" id="c-tls"> TLS</label>
+      <p class="form-error" id="c-error" hidden></p>
+      <div class="modal-actions">
+        <button class="btn" value="cancel" formnovalidate>Cancel</button>
+        <button class="btn btn-primary" id="c-submit" value="ok">Add &amp; monitor</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>
