@@ -18,11 +18,18 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -276,6 +283,7 @@ func main() {
 	muxKeyFile := flag.String("mux-key-file", "/etc/v2ray/mux.key", "pre-shared key file for the /mux session protocol (missing = disabled)")
 	maxConns := flag.Int("max-conns", 2048, "max concurrent connections")
 	name := flag.String("name", "V2Ray Node 1", "server instance name")
+	tlsListen := flag.String("tls-listen", "", "optional HTTPS listen address (e.g. 0.0.0.0:443) with a self-signed cert, for Cloudflare-proxied origins without nginx")
 	flag.Parse()
 	nodeName = *name
 
@@ -311,11 +319,26 @@ func main() {
 		ReadHeaderTimeout: handshakeTimeout,
 		IdleTimeout:       idleTimeout,
 		MaxHeaderBytes:    maxHeaderBytes,
+		// HTTP/1.1 only: the WS and /mux upgrades hijack the connection.
+		TLSNextProto: map[string]func(*http.Server, *tls.Conn, http.Handler){},
 	}
 
 	log.Printf("[V2Ray-Proxy] %s -> VLESS-WS:%s | VMess-WS:%s | XHTTP:%s%s | mux:%v | panel:%s (max-conns=%d)",
 		*listen, *vless, *vmess, *xhttp, rt.xhttpPrefix, rt.muxKey != nil, *httpUp, *maxConns)
 	log.Printf("[V2Ray-Proxy] %s", serverBanner())
+
+	if *tlsListen != "" {
+		tlsLn, err := selfSignedTLSListener(*tlsListen, *maxConns)
+		if err != nil {
+			log.Fatalf("tls bind %s: %v", *tlsListen, err)
+		}
+		log.Printf("[V2Ray-Proxy] HTTPS (self-signed) on %s", *tlsListen)
+		go func() {
+			if err := srv.Serve(tlsLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Fatal(err)
+			}
+		}()
+	}
 
 	go func() {
 		<-ctx.Done()
@@ -337,4 +360,40 @@ func main() {
 	case <-time.After(10 * time.Second):
 		log.Println("timeout, forcing exit.")
 	}
+}
+
+// selfSignedTLSListener listens on addr with a fresh self-signed certificate.
+// Cloudflare's "Full" SSL mode accepts any origin certificate, so a proxied node
+// can terminate TLS here instead of running nginx.
+func selfSignedTLSListener(addr string, maxConns int) (net.Listener, error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, err
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().UnixNano()),
+		Subject:      pkix.Name{CommonName: "origin"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().AddDate(10, 0, 0),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		return nil, err
+	}
+	taddr, err := net.ResolveTCPAddr("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	tl, err := net.ListenTCP("tcp", taddr)
+	if err != nil {
+		return nil, err
+	}
+	cfg := &tls.Config{
+		Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}},
+		NextProtos:   []string{"http/1.1"},
+		MinVersion:   tls.VersionTLS12,
+	}
+	return tls.NewListener(&limitListener{TCPListener: tl, sem: make(chan struct{}, maxConns)}, cfg), nil
 }

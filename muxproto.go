@@ -61,8 +61,16 @@ const (
 	muxMaxPayload = 32 * 1024
 	muxMaxRecord  = muxFrameHdr + muxMaxPayload + 16
 
-	muxWindow      = 4 << 20 // per-stream receive window (bytes)
-	muxWindowDelta = muxWindow / 4
+	muxWindow      = 4 << 20   // per-stream receive window (bytes)
+	muxWindowDelta = 128 << 10 // return credit after this many bytes are read
+	// muxSendWindow caps a stream's unacknowledged bytes in flight, below the
+	// window the peer grants. Bytes in flight sit in Cloudflare and carrier
+	// buffers, and every other stream's data waits behind them, so a 4 MB
+	// window let one download stall the whole link for seconds. It must stay
+	// above 1 MB, the credit step of older peers (muxWindow/4).
+	muxSendWindow = 1280 << 10
+	// muxStreamQueue bounds DATA a stream may queue for the writer.
+	muxStreamQueue = 2 * muxMaxPayload
 	muxReplayCap   = 8 << 20 // max buffered unacked reliable bytes before Write() blocks
 	muxAckEvery    = 64      // send an ACK after this many reliable frames received
 
@@ -269,6 +277,37 @@ type muxSession struct {
 
 	reg       *muxResumeRegistry // server only
 	detachGen atomic.Uint64      // server only: bumped each time the session detaches
+
+	sched muxSched
+}
+
+// muxSched orders outgoing frames for the session's writer goroutine: control
+// frames (window updates, pings, DNS) first, then streams take turns one frame
+// at a time, so a bulk transfer cannot hold up other streams or the replies
+// the read loop has to send. A stream's own frames stay in order.
+type muxSched struct {
+	mu     sync.Mutex
+	cond   *sync.Cond
+	ctrl   []muxQFrame
+	queues map[uint32]*muxStreamQ
+	ring   []uint32 // streams with queued frames, in service order
+}
+
+type muxQFrame struct {
+	typ     byte
+	id      uint32
+	payload []byte
+}
+
+type muxStreamQ struct {
+	frames []muxQFrame
+	bytes  int
+}
+
+// muxStreamOrdered reports whether a frame must stay in order with the
+// stream's DATA (an OPEN before its data, a FIN or RST after it).
+func muxStreamOrdered(typ byte) bool {
+	return typ == muxOpen || typ == muxData || typ == muxFin || typ == muxRst
 }
 
 func newMuxSession(link *muxLink, isClient bool) *muxSession {
@@ -282,6 +321,9 @@ func newMuxSession(link *muxLink, isClient bool) *muxSession {
 		helloCh:    make(chan struct{}, 1),
 	}
 	s.linkCond = sync.NewCond(&s.wmu)
+	s.sched.cond = sync.NewCond(&s.sched.mu)
+	s.sched.queues = make(map[uint32]*muxStreamQ)
+	go s.writeLoop()
 	if isClient {
 		s.nextID = 1
 	} else {
@@ -291,11 +333,94 @@ func newMuxSession(link *muxLink, isClient bool) *muxSession {
 	return s
 }
 
-// send writes one frame. Reliable frames are numbered and buffered for replay;
-// if the link is momentarily down they queue and flush on resume (Write only
-// blocks once the replay buffer is full). Unreliable frames are dropped if the
-// link is down.
+// send queues one frame for the writer goroutine. DATA blocks while the
+// stream already has muxStreamQueue bytes waiting; nothing else blocks, so the
+// read loop can always answer pings and return window credit.
 func (s *muxSession) send(typ byte, id uint32, payload []byte) error {
+	if s.closed.Load() {
+		return errMuxClosed
+	}
+	f := muxQFrame{typ: typ, id: id, payload: append([]byte(nil), payload...)}
+	q := &s.sched
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if !muxStreamOrdered(typ) {
+		q.ctrl = append(q.ctrl, f)
+		q.cond.Broadcast()
+		return nil
+	}
+	sq := q.queues[id]
+	if sq == nil {
+		sq = &muxStreamQ{}
+		q.queues[id] = sq
+		q.ring = append(q.ring, id)
+	}
+	for typ == muxData && sq.bytes >= muxStreamQueue && !s.closed.Load() {
+		q.cond.Wait()
+		if q.queues[id] != sq { // drained and removed while we waited
+			if sq = q.queues[id]; sq == nil {
+				sq = &muxStreamQ{}
+				q.queues[id] = sq
+				q.ring = append(q.ring, id)
+			}
+		}
+	}
+	if s.closed.Load() {
+		return errMuxClosed
+	}
+	sq.frames = append(sq.frames, f)
+	sq.bytes += len(f.payload)
+	q.cond.Broadcast()
+	return nil
+}
+
+// nextFrame blocks until a frame is queued and returns it; false once the
+// session is closed.
+func (s *muxSession) nextFrame() (muxQFrame, bool) {
+	q := &s.sched
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for len(q.ctrl) == 0 && len(q.ring) == 0 && !s.closed.Load() {
+		q.cond.Wait()
+	}
+	if s.closed.Load() {
+		return muxQFrame{}, false
+	}
+	if len(q.ctrl) > 0 {
+		f := q.ctrl[0]
+		q.ctrl = q.ctrl[1:]
+		return f, true
+	}
+	id := q.ring[0]
+	q.ring = q.ring[1:]
+	sq := q.queues[id]
+	f := sq.frames[0]
+	sq.frames = sq.frames[1:]
+	sq.bytes -= len(f.payload)
+	if len(sq.frames) > 0 {
+		q.ring = append(q.ring, id) // back of the line: round-robin
+	} else {
+		delete(q.queues, id)
+	}
+	q.cond.Broadcast()
+	return f, true
+}
+
+func (s *muxSession) writeLoop() {
+	for {
+		f, ok := s.nextFrame()
+		if !ok {
+			return
+		}
+		_ = s.transmit(f.typ, f.id, f.payload)
+	}
+}
+
+// transmit writes one frame on the link. Reliable frames are numbered and
+// buffered for replay; if the link is momentarily down they queue and flush on
+// resume (the writer only blocks once the replay buffer is full). Unreliable
+// frames are dropped if the link is down. Only the writer goroutine calls it.
+func (s *muxSession) transmit(typ byte, id uint32, payload []byte) error {
 	s.wmu.Lock()
 	defer s.wmu.Unlock()
 	if s.closed.Load() {
@@ -315,7 +440,7 @@ func (s *muxSession) send(typ byte, id uint32, payload []byte) error {
 		return errMuxClosed
 	}
 	s.txSeq++
-	buf := append([]byte(nil), payload...)
+	buf := payload // send() already copied it
 	s.replay = append(s.replay, muxReplayEntry{idx: s.txSeq, typ: typ, id: id, payload: buf})
 	s.replayBytes += len(buf)
 	if s.link != nil {
@@ -435,6 +560,11 @@ func (s *muxSession) closeWith(err error) error {
 	}
 	close(s.done)
 	s.linkCond.Broadcast()
+	s.sched.mu.Lock()
+	s.sched.ctrl, s.sched.ring = nil, nil
+	s.sched.queues = make(map[uint32]*muxStreamQ)
+	s.sched.cond.Broadcast()
+	s.sched.mu.Unlock()
 
 	s.mu.Lock()
 	streams := make([]*muxStream, 0, len(s.streams))
@@ -1096,7 +1226,7 @@ func (st *muxStream) Write(b []byte) (int, error) {
 	total := 0
 	for len(b) > 0 {
 		st.mu.Lock()
-		for st.credit <= 0 && st.err == nil && !st.finSent && !st.closed {
+		for st.credit <= muxWindow-muxSendWindow && st.err == nil && !st.finSent && !st.closed {
 			if !st.waitLocked(st.writeDeadline) {
 				st.mu.Unlock()
 				return total, errMuxTimeout
@@ -1112,8 +1242,8 @@ func (st *muxStream) Write(b []byte) (int, error) {
 			return total, net.ErrClosed
 		}
 		n := len(b)
-		if int64(n) > st.credit {
-			n = int(st.credit)
+		if avail := st.credit - (muxWindow - muxSendWindow); int64(n) > avail {
+			n = int(avail)
 		}
 		if n > muxMaxPayload {
 			n = muxMaxPayload
