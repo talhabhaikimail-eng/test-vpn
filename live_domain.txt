@@ -1,2 +1,2 @@
 tunnel.ufone-claim.site
-spatial-file-highlight-driven.trycloudflare.com
+tunnel2.ufone-claim.site
