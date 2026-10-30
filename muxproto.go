@@ -37,6 +37,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -1326,6 +1327,10 @@ func (st *muxStream) SetWriteDeadline(t time.Time) error {
 
 // muxServeStream dials host:port and pipes it to the stream. Used by the node.
 func muxServeStream(st *muxStream, host string, port int, initial []byte, d *net.Dialer) {
+	if host == muxUDPHost {
+		muxServeUDP(st, initial)
+		return
+	}
 	if d == nil {
 		d = &net.Dialer{Timeout: 10 * time.Second}
 	}
@@ -1395,6 +1400,156 @@ func muxServeStream(st *muxStream, host string, port int, initial []byte, d *net
 	<-done
 	_ = target.Close()
 	_ = st.Close()
+}
+
+// ── UDP relay ────────────────────────────────────────────────────────────────
+
+// muxUDPHost is a reserved OPEN target: instead of dialing TCP, the node relays
+// UDP datagrams carried on the stream. Games and calls need UDP, and Cloudflare
+// only carries TCP, so the datagrams travel inside the session. Each one is
+// framed like hev-socks5's "UDP in TCP" mode, which the Android tun already
+// speaks, so the client just pipes bytes:
+//
+//	[data len u16 BE][header len u8 = 3 + addr len][ATYP ADDR PORT][data]
+//
+// An older node treats the name as a host it cannot resolve and resets the
+// stream, so UDP keeps failing as before instead of breaking anything.
+const muxUDPHost = "udp.mux.internal"
+
+// muxUDPIdle closes a relay with no traffic in either direction.
+const muxUDPIdle = 2 * time.Minute
+
+// muxUDPAllowed filters relay destinations; the node refuses private ranges.
+var muxUDPAllowed = func(ip net.IP) bool { return true }
+
+func muxServeUDP(st *muxStream, initial []byte) {
+	defer st.Close()
+	pc, err := net.ListenPacket("udp", ":0")
+	if err != nil {
+		return
+	}
+	defer pc.Close()
+
+	var last atomic.Int64
+	touch := func() { last.Store(time.Now().UnixNano()) }
+	touch()
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		t := time.NewTicker(10 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				if time.Since(time.Unix(0, last.Load())) > muxUDPIdle {
+					_ = pc.Close()
+					_ = st.Close()
+					return
+				}
+			}
+		}
+	}()
+
+	// Replies: UDP -> stream, tagged with the sender's address.
+	go func() {
+		buf := make([]byte, 65535)
+		var out []byte
+		for {
+			n, from, err := pc.ReadFrom(buf)
+			if err != nil {
+				_ = st.Close()
+				return
+			}
+			ua, ok := from.(*net.UDPAddr)
+			if !ok {
+				continue
+			}
+			touch()
+			out = muxUDPAppendFrame(out[:0], ua, buf[:n])
+			if _, err := st.Write(out); err != nil {
+				_ = pc.Close()
+				return
+			}
+		}
+	}()
+
+	// Requests: stream -> UDP.
+	r := io.MultiReader(bytes.NewReader(initial), st)
+	var hdr [3]byte
+	body := make([]byte, 255+65535)
+	names := map[string]*net.UDPAddr{}
+	for {
+		if _, err := io.ReadFull(r, hdr[:]); err != nil {
+			return
+		}
+		dlen := int(binary.BigEndian.Uint16(hdr[:2]))
+		alen := int(hdr[2]) - 3
+		if alen < 4 { // shortest address: ATYP + 1-char domain + port
+			return
+		}
+		if _, err := io.ReadFull(r, body[:alen+dlen]); err != nil {
+			return
+		}
+		ua := muxUDPParseAddr(body[:alen], names)
+		if ua == nil || !muxUDPAllowed(ua.IP) {
+			continue
+		}
+		touch()
+		_, _ = pc.WriteTo(body[alen:alen+dlen], ua)
+	}
+}
+
+// muxUDPParseAddr decodes ATYP ADDR PORT; domains are resolved once per relay.
+func muxUDPParseAddr(a []byte, names map[string]*net.UDPAddr) *net.UDPAddr {
+	switch a[0] {
+	case 0x01:
+		if len(a) != 7 {
+			return nil
+		}
+		return &net.UDPAddr{IP: net.IP(append([]byte(nil), a[1:5]...)), Port: int(binary.BigEndian.Uint16(a[5:7]))}
+	case 0x04:
+		if len(a) != 19 {
+			return nil
+		}
+		return &net.UDPAddr{IP: net.IP(append([]byte(nil), a[1:17]...)), Port: int(binary.BigEndian.Uint16(a[17:19]))}
+	case 0x03:
+		n := int(a[1])
+		if len(a) != 2+n+2 {
+			return nil
+		}
+		hp := net.JoinHostPort(string(a[2:2+n]), fmt.Sprint(binary.BigEndian.Uint16(a[2+n:])))
+		if ua, ok := names[hp]; ok {
+			return ua
+		}
+		ua, err := net.ResolveUDPAddr("udp", hp)
+		if err != nil {
+			return nil
+		}
+		names[hp] = ua
+		return ua
+	}
+	return nil
+}
+
+// muxUDPAppendFrame appends one framed datagram from addr to out.
+func muxUDPAppendFrame(out []byte, addr *net.UDPAddr, data []byte) []byte {
+	ip4 := addr.IP.To4()
+	alen := 19
+	if ip4 != nil {
+		alen = 7
+	}
+	out = append(out, byte(len(data)>>8), byte(len(data)), byte(3+alen))
+	if ip4 != nil {
+		out = append(out, 0x01)
+		out = append(out, ip4...)
+	} else {
+		out = append(out, 0x04)
+		out = append(out, addr.IP.To16()...)
+	}
+	out = append(out, byte(addr.Port>>8), byte(addr.Port))
+	return append(out, data...)
 }
 
 // muxReadPSKFile loads a pre-shared key from a file, trimming whitespace.

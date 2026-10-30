@@ -1,0 +1,57 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CloudFront front for the Xray node (VLESS XHTTP /xh, VLESS WS /, VMess WS /).
+  No caching, all methods (XHTTP packet-up needs POST), Host rewritten to the origin.
+
+Parameters:
+  OriginDomain:
+    Type: String
+    Default: v2ray.ufone-claim.site
+    Description: >
+      Stable hostname of the Xray node. The named Cloudflare tunnel (live_domain_v2ray.txt)
+      or a VPS with a valid cert. Never a trycloudflare.com URL (changes every run).
+  OriginProtocol:
+    Type: String
+    Default: https-only
+    AllowedValues: [https-only, http-only]
+    Description: https-only needs a valid cert for OriginDomain (Cloudflare edge has one).
+
+Resources:
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: xray-front
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_All
+        Origins:
+          - Id: xray
+            DomainName: !Ref OriginDomain
+            CustomOriginConfig:
+              OriginProtocolPolicy: !Ref OriginProtocol
+              HTTPSPort: 443
+              HTTPPort: 80
+              OriginSSLProtocols: [TLSv1.2]
+              # XHTTP downlink is a long-lived GET; 60 s is the max without an AWS quota request.
+              OriginReadTimeout: 60
+              OriginKeepaliveTimeout: 60
+        DefaultCacheBehavior:
+          TargetOriginId: xray
+          ViewerProtocolPolicy: allow-all
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          CachedMethods: [GET, HEAD]
+          Compress: false
+          # Managed-CachingDisabled
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          # Managed-AllViewerExceptHostHeader: forwards query (?ed=2048), headers, cookies;
+          # Host becomes OriginDomain so the Cloudflare tunnel / vhost matches.
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+
+Outputs:
+  DistributionDomain:
+    Description: Put this in SNI and Host on the client (address = bug host)
+    Value: !GetAtt Distribution.DomainName
+  DistributionId:
+    Value: !Ref Distribution

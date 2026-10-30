@@ -78,6 +78,13 @@ var muxDialer = &net.Dialer{
 	},
 }
 
+func init() {
+	// The UDP relay must not reach the node's own or private services either.
+	muxUDPAllowed = func(ip net.IP) bool {
+		return !(ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() || ip.IsMulticast())
+	}
+}
+
 // ── DNS: forward raw queries over UDP with a small cache ─────────────────────
 
 type muxDNSEntry struct {

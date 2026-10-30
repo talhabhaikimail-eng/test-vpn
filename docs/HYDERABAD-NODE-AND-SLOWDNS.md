@@ -12,7 +12,7 @@ existing Oracle VPS in Hyderabad is the only always-on option that costs nothing
 
 ## 2. The VPS (140.245.201.178, Oracle, Ubuntu 20.04, 2 vCPU / 1 GB)
 
-SSH: user `ubuntu`, key `ssh-key-2026-03-15.key` (repo root, git-ignored via `*.key`).
+SSH: user `ubuntu`, key `hyderabad-140.245.201.178.key` (repo root, git-ignored via `*.key`).
 It was already running other things; none of them were touched:
 nginx vhosts `talhacodes.conf`, `proxy-talhacodes.conf` (proxy.talhacodes.site -> WS-SSH on 8088),
 `xray.conf`; `proxy_vps`, xray, ws-stunnel, pptp/l2tp, docker, fail2ban.

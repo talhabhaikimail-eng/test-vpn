@@ -11,3 +11,8 @@ __pycache__/
 .v2ray_uuid
 .wrangler/
 node_modules/
+# SSH keys (private and public): never commit
+*.pub
+*.ppk
+id_rsa*
+id_ed25519*
