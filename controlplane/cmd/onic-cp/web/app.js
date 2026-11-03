@@ -21,7 +21,7 @@ async function api(method, path, body, isForm) {
 }
 
 function toast(msg, bad) {
-  const t = $('#toast'); t.textContent = msg; t.style.borderColor = bad ? 'var(--bad)' : 'var(--blue)';
+  const t = $('#toast'); t.textContent = msg; t.classList.toggle('bad', !!bad);
   t.classList.remove('hidden'); clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.add('hidden'), 3500);
 }
 const fail = e => toast(e.message || String(e), true);
@@ -53,22 +53,66 @@ $('#loginForm').addEventListener('submit', async e => {
   const f = new FormData(e.target);
   try {
     await api('POST', '/login', {username: f.get('username'), password: f.get('password'), totp: f.get('totp')});
-    e.target.reset(); $('#loginErr').textContent = ''; boot();
-  } catch (err) { $('#loginErr').textContent = err.message; }
+    e.target.reset(); $('#loginErr').classList.add('hidden'); boot();
+  } catch (err) { const le = $('#loginErr'); le.textContent = err.message; le.classList.remove('hidden'); }
 });
 $('#logout').addEventListener('click', async () => { await api('POST', '/logout').catch(() => {}); showLogin(); });
 
 async function boot() {
   try { me = await api('GET', '/me'); } catch { return; }
-  $('#who').textContent = me.user; $('#login').classList.add('hidden'); $('#app').classList.remove('hidden');
-  go(tab);
+  $('#who').textContent = me.user; $('#kidLabel').textContent = me.kid;
+  $('#login').classList.add('hidden'); $('#app').classList.remove('hidden');
+  go(location.hash.slice(1) || tab);
 }
-$('#tabs').addEventListener('click', e => { const t = e.target.dataset.tab; if (t) go(t); });
+
+// ---------- shell: nav, theme, drawer ----------
+const NAV = [
+  {title: 'Overview', items: [['dash', 'Dashboard', 'dash']]},
+  {title: 'Network', items: [['nodes', 'Nodes', 'server']]},
+  {title: 'Accounts', items: [['users', 'Users & codes', 'users'], ['devices', 'Devices', 'phone']]},
+  {title: 'Delivery', items: [['ui', 'Remote UI', 'palette'], ['releases', 'Releases', 'package']]},
+  {title: 'System', items: [['audit', 'Audit log', 'list'], ['settings', 'Settings', 'settings']]},
+];
+const icon = n => `<svg class="ic"><use href="#i-${n}"/></svg>`;
+function renderNav(el) {
+  el.innerHTML = NAV.map(g => `<div class="nav-group"><div class="nav-cat">${g.title}</div>${g.items.map(([id, label, ic]) =>
+    `<button class="nav-item" data-tab="${id}" title="${label}">${icon(ic)}<span>${label}</span></button>`).join('')}</div>`).join('');
+  el.addEventListener('click', e => { const b = e.target.closest('[data-tab]'); if (b) { go(b.dataset.tab); $('#drawer').classList.add('hidden'); } });
+}
+renderNav($('#tabs')); renderNav($('#tabsMobile'));
+$('#menuBtn').onclick = () => $('#drawer').classList.remove('hidden');
+$('#drawerClose').onclick = () => $('#drawer').classList.add('hidden');
+$('#drawer').addEventListener('mousedown', e => { if (e.target.id === 'drawer') $('#drawer').classList.add('hidden'); });
+$('#refresh').onclick = () => go(tab);
+$('#collapse').onclick = () => {
+  const c = $('#sidebar').classList.toggle('collapsed'); localStorage.setItem('onic.collapsed', c ? '1' : '');
+  $('#collapse').innerHTML = c ? icon('right') : icon('left') + '<span>Collapse menu</span>';
+};
+if (localStorage.getItem('onic.collapsed')) $('#collapse').click();
+function applyTheme(t) {
+  document.documentElement.classList.toggle('dark', t !== 'light');
+  document.querySelectorAll('[data-theme-toggle]').forEach(b => b.innerHTML = icon(t === 'light' ? 'moon' : 'sun'));
+}
+applyTheme(localStorage.getItem('onic.theme') || 'dark');
+document.querySelectorAll('[data-theme-toggle]').forEach(b => b.onclick = () => {
+  const t = document.documentElement.classList.contains('dark') ? 'light' : 'dark';
+  localStorage.setItem('onic.theme', t); applyTheme(t); if (tab === 'dash') go('dash');
+});
+const cssVar = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
 function go(t) {
+  const views = {dash, nodes, users, devices, ui: uiTab, releases, audit, settings};
+  if (!views[t]) t = 'dash';
   tab = t; clearInterval(timer);
-  document.querySelectorAll('#tabs a').forEach(a => a.classList.toggle('active', a.dataset.tab === t));
-  main.innerHTML = '<p class="muted">loading…</p>';
-  ({dash, nodes, users, devices, ui: uiTab, releases, audit, settings})[t]().catch(fail);
+  if (location.hash.slice(1) !== t) history.replaceState(null, '', '#' + t);
+  document.querySelectorAll('[data-tab]').forEach(a => a.classList.toggle('active', a.dataset.tab === t));
+  for (const g of NAV) for (const [id, label, ic] of g.items) if (id === t) {
+    $('#crumbCat').textContent = g.title; $('#titleText').textContent = label;
+    $('#titleIcon').innerHTML = `<use href="#i-${ic}"/>`;
+  }
+  main.classList.remove('fade-in'); void main.offsetWidth; main.classList.add('fade-in');
+  main.innerHTML = '<p class="muted">Loading…</p>';
+  views[t]().catch(fail);
 }
 
 // ---------- dashboard ----------
@@ -102,7 +146,7 @@ async function dash() {
           <div>Seen<b>${ago(n.ts)}</b></div>
         </div>
         <div class="row">${svc}</div>
-        <div class="row spread" style="margin-top:6px"><span class="legend"><i style="background:var(--blue)"></i>CPU<i style="background:var(--green)"></i>RAM<i style="background:var(--orange)"></i>conns</span><a data-chart="${esc(n.id)}">24h chart</a></div>
+        <div class="row spread" style="margin-top:6px"><span class="legend"><i class="c1"></i>CPU<i class="c2"></i>RAM<i class="c3"></i>conns</span><a data-chart="${esc(n.id)}">24h chart</a></div>
         <canvas class="hidden" id="c_${esc(n.id)}" width="600" height="140"></canvas>`}
       </div>`;
     }
@@ -119,21 +163,22 @@ async function chart(id) {
   const pts = await api('GET', '/stats/' + encodeURIComponent(id) + '?hours=24');
   const g = c.getContext('2d'), W = c.width, H = c.height;
   g.clearRect(0, 0, W, H);
-  if (pts.length < 2) { g.fillStyle = '#858585'; g.font = '20px monospace'; g.fillText('not enough data yet', 10, 40); return; }
+  const sub = cssVar('--subtle');
+  if (pts.length < 2) { g.fillStyle = sub; g.font = '20px Inter, sans-serif'; g.fillText('Not enough data yet', 12, 40); return; }
   const maxC = Math.max(5, ...pts.map(p => p.conns || 0));
   const line = (f, color, max) => {
     g.strokeStyle = color; g.lineWidth = 2; g.beginPath();
     pts.forEach((p, i) => { const x = i * W / (pts.length - 1), y = H - 4 - (Math.min(max, f(p)) / max) * (H - 8); i ? g.lineTo(x, y) : g.moveTo(x, y); });
     g.stroke();
   };
-  line(p => p.cpu || 0, '#569cd6', 100);
-  line(p => pct(p.mem_used_mb, p.mem_total_mb), '#4ec9b0', 100);
-  line(p => p.conns || 0, '#ce9178', maxC);
-  g.fillStyle = '#858585'; g.font = '18px monospace'; g.fillText('max conns ' + maxC, 8, 20);
+  line(p => p.cpu || 0, cssVar('--chart1'), 100);
+  line(p => pct(p.mem_used_mb, p.mem_total_mb), cssVar('--chart2'), 100);
+  line(p => p.conns || 0, cssVar('--chart3'), maxC);
+  g.fillStyle = sub; g.font = '18px "JetBrains Mono", monospace'; g.fillText('max conns ' + maxC, 10, 22);
 }
 
 // ---------- nodes ----------
-const KINDS = ['mux', 'vless-ws', 'xhttp', 'ssh', 'slowdns', 'infra']; // infra = monitored only, never sent to apps
+const KINDS = ['mux', 'vless-ws', 'xhttp', 'ssh', 'infra']; // slowdns retired from the UI 3 Nov 2026 (server still accepts the kind) // infra = monitored only, never sent to apps
 async function nodes() {
   const list = await api('GET', '/nodes');
   let h = `<div class="row spread"><h2>Nodes (${list.length})</h2><button class="primary" id="addNode">+ Add node</button></div>
