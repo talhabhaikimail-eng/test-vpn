@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-sni_check.py - classify whether a host is usable as a (spoofed) SNI.
+sni.py - classify whether a host is usable as a (spoofed) SNI.
 
 "Usable as SNI" is TWO independent conditions. This tool is explicit about
 which half it can and cannot answer:
@@ -27,10 +27,10 @@ of service and may have legal exposure depending on jurisdiction. This is a
 diagnostic tool; know where you stand before relying on it.
 
 Usage:
-  python3 sni_check.py example.com cdn.example.com
-  python3 sni_check.py example.com --endpoint 203.0.113.9
-  python3 sni_check.py --file candidates.txt --endpoint 203.0.113.9:443
-  python3 sni_check.py --quota-guide
+  python sni.py example.com cdn.example.com
+  python sni.py example.com --endpoint 203.0.113.9
+  python sni.py --file candidates.txt --endpoint 203.0.113.9:443
+  python sni.py --quota-guide
 
 Optional (nicer cert details):  pip install cryptography
 """
@@ -297,7 +297,7 @@ def main():
 
     print(head("\nLegend: [BASE]=domain's own server  [YOURS]=your endpoint  "
                "[ISP]=unverifiable by script"))
-    print(dim("Run  python3 sni_check.py --quota-guide  for the carrier measurement steps."))
+    print(dim("Run  python sni.py --quota-guide  for the carrier measurement steps."))
 
 
 if __name__ == "__main__":

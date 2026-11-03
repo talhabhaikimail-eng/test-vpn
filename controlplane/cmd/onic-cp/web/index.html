@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Onic Control</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="login" class="login hidden">
+  <form id="loginForm" class="card">
+    <h1>onic<span>/control</span></h1>
+    <label>Username<input name="username" autocomplete="username" required></label>
+    <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
+    <label>Authenticator code<input name="totp" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" required></label>
+    <button class="primary" type="submit">Sign in</button>
+    <p id="loginErr" class="err"></p>
+  </form>
+</div>
+
+<div id="app" class="hidden">
+  <header>
+    <div class="brand">onic<span>/control</span></div>
+    <nav id="tabs">
+      <a data-tab="dash" class="active">Dashboard</a>
+      <a data-tab="nodes">Nodes</a>
+      <a data-tab="users">Users</a>
+      <a data-tab="devices">Devices</a>
+      <a data-tab="ui">Remote UI</a>
+      <a data-tab="releases">Releases</a>
+      <a data-tab="audit">Audit</a>
+      <a data-tab="settings">Settings</a>
+    </nav>
+    <div class="who"><span id="who"></span> <button id="logout" class="ghost">Sign out</button></div>
+  </header>
+  <main id="main"></main>
+</div>
+
+<div id="modal" class="modal hidden"><div class="card" id="modalBody"></div></div>
+<div id="toast" class="toast hidden"></div>
+<script src="/app.js"></script>
+</body>
+</html>

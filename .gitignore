@@ -16,3 +16,12 @@ node_modules/
 *.ppk
 id_rsa*
 id_ed25519*
+
+# control plane / tooling: local-only files (repo is public)
+*.private.md
+controlplane/dist/
+controlplane/ADMIN-CREDENTIALS.txt
+controlplane/**/*.db
+controlplane/**/sign.key
+snicheck/cands.txt
+snicheck/snicheck

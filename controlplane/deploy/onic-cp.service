@@ -1,0 +1,30 @@
+[Unit]
+Description=Onic control plane (config API, admin portal, OTA, stats)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=onic-cp
+Group=onic-cp
+ExecStart=/usr/local/bin/onic-cp serve -data /var/lib/onic-cp -api-host api.talhacodes.site -admin-host admin.talhacodes.site -cert /etc/onic-cp/tls/fullchain.pem -key /etc/onic-cp/tls/key.pem -acme-webroot /var/lib/onic-cp/acme
+Restart=always
+RestartSec=3
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=/var/lib/onic-cp
+ReadOnlyPaths=/etc/onic-cp
+MemoryMax=400M
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

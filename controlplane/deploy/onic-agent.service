@@ -1,0 +1,22 @@
+[Unit]
+Description=Onic stats agent (pushes /proc stats to the control plane)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Environment=GOMAXPROCS=1 GOGC=50 GOMEMLIMIT=12MiB
+EnvironmentFile=/etc/onic-agent.env
+ExecStart=/usr/local/bin/onic-agent
+Restart=always
+RestartSec=10
+DynamicUser=yes
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+MemoryMax=40M
+CPUQuota=5%
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
