@@ -1,2 +1,2 @@
 tunnel.ufone-claim.site
-alt-early-intake-geo.trycloudflare.com
+tunnel2.ufone-claim.site
