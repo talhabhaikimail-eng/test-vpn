@@ -25,3 +25,6 @@ controlplane/**/*.db
 controlplane/**/sign.key
 snicheck/cands.txt
 snicheck/snicheck
+
+# Local docs and notes (infra details, never publish; repo is public)
+/docs/
