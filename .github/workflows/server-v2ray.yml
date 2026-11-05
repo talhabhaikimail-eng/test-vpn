@@ -18,7 +18,7 @@ on:
         default: '345'
         type: string
       custom_domain:
-        description: 'Cloudflare Public Hostname for V2Ray (e.g. v2ray.ufone-claim.site)'
+        description: 'Cloudflare Public Hostname for V2Ray (e.g. v2ray.talhatechs.co.uk)'
         required: false
         default: ''
         type: string
@@ -159,7 +159,7 @@ jobs:
             if [ -z "$CUSTOM" ] && [ -f live_domain_v2ray.txt ]; then
               CUSTOM=$(cat live_domain_v2ray.txt | tr -d '\r' | xargs)
             fi
-            DOMAIN="${CUSTOM:-v2ray.ufone-claim.site}"
+            DOMAIN="${CUSTOM:-v2ray.talhatechs.co.uk}"
           else
             CF_URL=""
             for _ in $(seq 1 30); do

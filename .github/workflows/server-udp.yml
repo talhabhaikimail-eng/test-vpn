@@ -149,7 +149,7 @@ jobs:
           echo "cloudflared ready: $(grep -c 'Registered tunnel connection' cf_tunnel.log) edge connection(s)"
 
           DOMAIN="${{ secrets.CUSTOM_DOMAIN_UDP }}"
-          [ -z "$DOMAIN" ] && DOMAIN="tunnel-udp.ufone-claim.site"
+          [ -z "$DOMAIN" ] && DOMAIN="tunnel-udp.talhatechs.co.uk"
           echo "DOMAIN=$DOMAIN" >> $GITHUB_ENV
 
           git config user.name "github-actions[bot]"
