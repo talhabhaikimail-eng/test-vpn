@@ -227,8 +227,8 @@ Rollout order: the spare server itself → Riyadh → x-ui node → Hyderabad �
 | 2 | Spare VPS: TLS (Let's Encrypt), firewall (80/443 Cloudflare-only), systemd | **done** |
 | 3 | `onic-cp` backend, signed + device-encrypted `/v1/activate` and `/v1/config`, nodes seeded | **done**, selftest passes on the server |
 | 4 | Admin portal (dashboard, nodes, users/codes, devices, remote UI, releases, audit, settings) | **done**, login = password + TOTP |
-| 5 | `onic-agent` on cp, Riyadh (mux4), Hyderabad (mux3), Dubai (mux5) | **done**; x-ui node pending (SSH key rejected) |
-| 6 | Apps fetch config from the API | next |
+| 5 | `onic-agent` on cp, Riyadh (mux4), Hyderabad (mux3), Dubai (mux5), Frankfurt (mux6, 5 Nov) | **done**; x-ui node pending (SSH key rejected) |
+| 6 | Apps fetch config from the API | **done 5 Nov 2026** (Android 1.2.0, desktop 3.1.0): silent activation with a shared code (user "Public (silent)", unlimited code in /root/public-activation-code.txt on cp), mux nodes only, refresh button; pinning/R8 not done |
 | 7 | Per-user mux keys | later |
 | 8 | OTA in apps (signed APK self-update, server-driven UI) | backend side done; app side next |
 | 9 | Disable the shared PSK | last |
