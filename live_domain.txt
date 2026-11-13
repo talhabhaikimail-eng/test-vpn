@@ -1,2 +1,2 @@
 tunnel.ufone-claim.site
-queue-discussed-mike-harbour.trycloudflare.com
+tunnel2.ufone-claim.site
