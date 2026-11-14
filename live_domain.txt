@@ -1,2 +1,2 @@
 tunnel.ufone-claim.site
-publishing-reuters-tubes-winds.trycloudflare.com
+tunnel2.ufone-claim.site
